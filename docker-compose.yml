@@ -1,0 +1,22 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 1s
+      retries: 30
+
+  app:
+    build: .
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      CENTRIFUGE_SECRET: dev-secret-change-me
+      CENTRIFUGE_API_KEY: dev-api-key-change-me
+      REDIS_URL: redis://redis:6379/0
+    ports: ["3000:3000"]
+    command: ["perl", "-Ilib", "example.pl", "daemon", "-l", "http://*:3000"]

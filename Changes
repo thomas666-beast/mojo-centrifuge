@@ -1,0 +1,39 @@
+Revision history for Mojo-Centrifuge
+
+0.21  2026-10-31
+        - Phase 2: wired Mojo::Centrifuge::Protocol into the WebSocket
+          handler. `protocol => 'centrifuge'` now speaks the Centrifugo
+          JSON protocol (connect/subscribe/unsubscribe/publish/presence/
+          refresh/ping, result/error/push frames). Default remains
+          'legacy'.
+        - New attribute history_ttl (seconds, 0 = no expiry). When > 0,
+          the history key gets refreshed on every publish.
+        - New attribute presence_ttl (seconds, default 60). Presence is
+          now a Redis ZSET scored by join time; stale entries are
+          lazily removed on presence() queries.
+        - Legacy error replies are now structured: {error: {code,
+          message}} instead of a bare string. Message text is unchanged,
+          so clients matching on text keep working; clients matching on
+          the raw {error} value must use {error}{message}.
+        - Mojo::Centrifuge::Protocol now exports the ERR_* codes via
+          Exporter (:codes tag or individually).
+        - Added t/05-presence-ttl.t, t/06-centrifuge-wire.t,
+          t/07-history-ttl.t (mock Redis, no external services).
+        - ws_client.pl: two error-regex assertions updated to inspect
+          {error}{message} instead of the bare {error} string.
+
+0.20  2026-10-31
+        - Phase 1: added Mojo::Centrifuge::Protocol (Centrifugo JSON
+          frame codec, not yet wired into the WS handler).
+        - Auth: switched signature comparison to Mojo::Util::secure_compare.
+        - Added POD to all public subs; pass AUTHOR_TESTING=1 with
+          Test::Pod and Test::Pod::Coverage.
+        - example.pl and make_token.pl are repo examples only, not
+          installed by Makefile.PL.
+        - Bumped $VERSION in Mojo::Centrifuge, Mojo::Centrifuge::Auth,
+          and added $VERSION to Mojo::Centrifuge::Protocol.
+
+0.19  2026-10-31
+        - Baseline: HMAC tokens, WS subscribe/unsubscribe, Redis
+          history + since replay, presence, keepalive, server API key,
+          client publish with permission check, glob authorization.
