@@ -3,28 +3,29 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Centrifuge demo</title>
+<title>Centrifuge demo (official centrifuge-js client)</title>
 <style>
   :root { --bg:#fff; --fg:#1a1a1a; --muted:#666; --line:#d8d8d8; --accent:#2a6df4; }
   @media (prefers-color-scheme: dark) {
     :root { --bg:#16181d; --fg:#e8e8e8; --muted:#9aa0a6; --line:#33373f; --accent:#6c9cff; }
   }
-  body { font: 15px/1.4 system-ui, sans-serif; background:var(--bg); color:var(--fg); max-width:760px; margin:2rem auto; padding:0 1rem; }
-  .row { display:flex; gap:.5rem; margin:.5rem 0; flex-wrap:wrap; }
+  body { font:15px/1.4 system-ui,sans-serif; background:var(--bg); color:var(--fg); max-width:760px; margin:2rem auto; padding:0 1rem; }
+  .row { display:flex; gap:.5rem; margin:.5rem 0; flex-wrap:wrap; align-items:center; }
   input, button { font:inherit; padding:.4rem .6rem; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); }
   button { cursor:pointer; background:var(--accent); color:#fff; border-color:var(--accent); }
   button:disabled { opacity:.5; cursor:default; }
-  #log { border:1px solid var(--line); border-radius:6px; height:280px; overflow:auto; padding:.5rem; font-family:ui-monospace, monospace; font-size:13px; }
-  #log div.sys { color:var(--muted); }
-  #status { color:var(--muted); }
+  #log { border:1px solid var(--line); border-radius:6px; height:300px; overflow:auto; padding:.5rem; font:13px ui-monospace,monospace; }
+  #log .sys { color:var(--muted); }
   #who span { display:inline-block; border:1px solid var(--line); border-radius:99px; padding:.1rem .6rem; margin:.15rem; }
+  #status { color:var(--muted); }
 </style>
 </head>
 <body>
 <h1>Centrifuge demo</h1>
+<p class="sys">Uses the official <code>centrifuge-js</code> SDK against <code>/connection/websocket</code>.</p>
 <div class="row">
   <input id="user" value="anna" size="10" aria-label="user">
-  <input id="chan" value="news" size="10" aria-label="channel">
+  <input id="chan" value="news" size="14" aria-label="channel (try chat:room1)">
   <button id="go">Connect</button>
   <span id="status">disconnected</span>
 </div>
@@ -35,66 +36,67 @@
 </div>
 <p>Online: <span id="who"></span></p>
 
-<script src="centrifuge.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/centrifuge@5/dist/centrifuge.js"></script>
 <script>
+  const CentrifugeClass = (window.Centrifuge && window.Centrifuge.Centrifuge) || window.Centrifuge;
   const $ = id => document.getElementById(id);
-  const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
-  let client = null, members = new Map();
+  const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/connection/websocket';
+  let client = null, sub = null;
 
   function log(text, cls) {
     const d = document.createElement('div');
     if (cls) d.className = cls;
-    d.textContent = text;                       // textContent: never inject message data as HTML
+    d.textContent = text;                          // never inject message data as HTML
     $('log').appendChild(d);
     $('log').scrollTop = $('log').scrollHeight;
   }
-  function renderWho() {
-    $('who').replaceChildren(...[...members.values()].sort().map(u => {
-      const s = document.createElement('span'); s.textContent = u; return s;
-    }));
-  }
-  async function refreshPresence(chan) {
+  async function refreshPresence() {
     try {
-      members = new Map((await client.presence(chan)).map(p => [p.id, p.user]));
-      renderWho();
-    } catch (e) { log('presence: ' + e.message, 'sys'); }
+      const res = await sub.presence();
+      const users = Object.values(res.clients).map(c => c.user).sort();
+      $('who').replaceChildren(...users.map(u => { const s = document.createElement('span'); s.textContent = u; return s; }));
+    } catch (e) { log('presence: ' + (e.message || e.code), 'sys'); }
   }
 
   $('go').onclick = () => {
-    if (client) { client.close(); client = null; $('go').textContent = 'Connect'; return; }
+    if (client) { client.disconnect(); client = null; sub = null; $('go').textContent = 'Connect'; return; }
     const user = $('user').value.trim() || 'anon', chan = $('chan').value.trim() || 'news';
-    client = new CentrifugeClient(wsUrl, {
-      getToken: () => fetch('/token?user=' + encodeURIComponent(user) + '&channel=' + encodeURIComponent(chan)).then(r => r.text()),
+
+    client = new CentrifugeClass(wsUrl, {
+      // called before every (re)connect and again when the token is about to expire
+      getToken: () => fetch('/token?user=' + encodeURIComponent(user)).then(r => r.text()),
     });
-    client.subscribe(chan, {
-      message: m => log('#' + m.seq + '  ' + (typeof m.data === 'string' ? m.data : JSON.stringify(m.data))),
-      join:  e => { members.set(e.id, e.user); renderWho(); log(e.user + ' joined', 'sys'); },
-      leave: e => { members.delete(e.id);      renderWho(); log(e.user + ' left', 'sys'); },
+    client.on('state', ctx => { $('status').textContent = ctx.newState; });
+    client.on('connected', ctx => {
+      log('connected (client ' + ctx.client + ')', 'sys');
+      $('msg').disabled = $('send').disabled = false;
     });
-    client.on('state', s => { $('status').textContent = s; })
-          .on('connect', () => {
-            log('connected as ' + user, 'sys');
-            $('msg').disabled = $('send').disabled = false;
-            refreshPresence(chan);              // snapshot again after every (re)connect
-          })
-          .on('disconnect', e => {
-            log('disconnected (' + (e.code || '?') + ')', 'sys');
-            $('msg').disabled = $('send').disabled = true;
-          })
-          .on('reconnecting', e => log('retry #' + e.attempt + ' in ' + e.delay + ' ms', 'sys'))
-          .on('error', e => log('error: ' + e.message, 'sys'));
+    client.on('disconnected', ctx => {
+      log('disconnected: ' + ctx.code + ' ' + ctx.reason, 'sys');
+      $('msg').disabled = $('send').disabled = true;
+    });
+    client.on('error', ctx => log('error: ' + JSON.stringify(ctx.error), 'sys'));
+
+    sub = client.newSubscription(chan);
+    sub.on('subscribed', ctx => {
+      log('subscribed to ' + chan + (ctx.wasRecovering ? (ctx.recovered ? ' (history recovered)' : ' (history NOT recovered)') : ''), 'sys');
+      refreshPresence();
+    });
+    sub.on('publication', ctx => log('#' + (ctx.offset || '-') + '  ' + (typeof ctx.data === 'string' ? ctx.data : JSON.stringify(ctx.data))));
+    sub.on('join',  ctx => { log(ctx.info.user + ' joined', 'sys'); refreshPresence(); });
+    sub.on('leave', ctx => { log(ctx.info.user + ' left', 'sys');   refreshPresence(); });
+    sub.on('error', ctx => log('subscription error: ' + JSON.stringify(ctx.error), 'sys'));
+    sub.subscribe();
     client.connect();
     $('go').textContent = 'Disconnect';
   };
 
   function send() {
     const text = $('msg').value.trim();
-    if (!text || !client) return;
-    client.publish($('chan').value.trim() || 'news', user_prefix() + text)
-          .then(() => { $('msg').value = ''; })
-          .catch(e => log('publish failed: ' + e.message, 'sys'));
+    if (!text || !sub) return;
+    const who = $('user').value.trim() || 'anon';
+    sub.publish(who + ': ' + text).then(() => { $('msg').value = ''; }, e => log('publish failed: ' + (e.message || e.code), 'sys'));
   }
-  const user_prefix = () => ($('user').value.trim() || 'anon') + ': ';
   $('send').onclick = send;
   $('msg').onkeydown = e => { if (e.key === 'Enter') send(); };
 </script>
