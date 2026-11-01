@@ -3,7 +3,7 @@ use Mojo::Base -base;
 use Mojo::JSON qw(encode_json decode_json);
 use Exporter 'import';
 
-our $VERSION = '0.21';
+our $VERSION = '0.30';
 
 our @EXPORT_OK = qw(
     ERR_INTERNAL
@@ -90,6 +90,8 @@ sub push_frame {
             data   => $args{data},
             offset => defined $args{seq} ? $args{seq} : 0,
         };
+        $push->{pub}{tags} = $args{tags}
+            if ref $args{tags} eq 'HASH' && keys %{ $args{tags} };
     }
     return encode_json({ push => $push });
 }

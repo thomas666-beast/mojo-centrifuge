@@ -42,13 +42,16 @@ sub publish {
     my ($msg, $cb) = @_;
     get_token('publisher', $chan, sub {
         my $tok = shift;
-        $ua->get("$base/publish?channel=$chan&msg=$msg&token=$tok" => sub {
-            my ($ua, $tx) = @_;
-            my $body = $tx->res->body // '(no body)';
-            chomp $body;
-            say "publish: $body";
-            $cb->() if $cb;
-        });
+        $ua->post("$base/publish" =>
+            { Authorization => "Bearer $tok" } =>
+            json => { channel => $chan, data => $msg } =>
+            sub {
+                my ($ua, $tx) = @_;
+                my $body = $tx->res->body // '(no body)';
+                chomp $body;
+                say "publish: $body";
+                $cb->() if $cb;
+            });
     });
 }
 
@@ -94,11 +97,9 @@ sub phase_ping {
                     $tx->send(encode_json({ pong => 1 }));
                     return;
                 }
-                # app messages
                 say "  [erin] channel=" . ($m->{channel} // '?') . " seq=" . ($m->{seq} // '?') . " " . ($m->{data} // '');
             });
 
-            # Keep the connection open for ~30s (default ping_interval is 25s)
             Mojo::IOLoop->timer(35 => sub {
                 if ($pings >= 1) {
                     say "\nPASS keepalive: received $pings server ping(s) in 35s";
@@ -128,7 +129,6 @@ sub phase_clientpub {
     return if $cpub_done++;
     say "\n=== client publish phase (Tasks 16/17) ===";
 
-    # Bad token must be rejected with a real HTTP 401 before the upgrade
     $ua->websocket("$base/ws?channel=$chan&token=garbage" => sub {
         my ($ua, $tx) = @_;
         my $code = $tx->res->code // 0;
@@ -136,9 +136,9 @@ sub phase_clientpub {
         else { say "FAIL 401: websocket=" . ($tx->is_websocket ? 1 : 0) . " code=$code"; $exit = 1 }
     });
 
-    get_token('frank', $chan, sub {                        # rw: may publish (channel binding)
+    get_token('frank', $chan, sub {
         my $tok_rw = shift;
-        get_token_q("user=ro&subscribe=$chan", sub {       # ro: subscribe only, no publish
+        get_token_q("user=ro&subscribe=$chan", sub {
             my $tok_ro = shift;
 
             $ua->websocket("$base/ws?channel=$chan&token=$tok_rw" => sub {
@@ -270,7 +270,6 @@ sub phase_apikey {
                                 $r{api_live} = (grep { ref($_->{data}) eq 'HASH' } @m1) == 3;
                                 $s1->finish;
 
-                                # a fresh client asks for everything after seq1 via {subscribe, since}
                                 get_token('sub2', $room, sub {
                                     my $tok2 = shift;
                                     $ua->websocket("$base/ws?token=$tok2" => sub {
@@ -285,7 +284,6 @@ sub phase_apikey {
                                             my @rep = grep { ref($_->{data}) eq 'HASH' } @m2;
                                             $r{since_replay} = (@rep == 2 && $rep[0]{seq} == $seq1 + 1 && $rep[1]{seq} == $seq1 + 2);
 
-                                            # replies echo the request id
                                             $s2->send(encode_json({ publish => $room, data => 'x', id => 'r1' }));
                                             $s2->send(encode_json({ presence => $room, id => 'r2' }));
                                         });
@@ -294,19 +292,16 @@ sub phase_apikey {
                                                        && (grep { ($_->{id} // '') eq 'r2' && ref $_->{presence} eq 'ARRAY' } @m2);
                                             $s2->finish;
 
-                                            # wrong API key -> 401
                                             $ua->post("$base/publish" => { 'X-API-Key' => 'wrong' } => json => { channel => $room, data => 1 } => sub {
                                                 my ($ua, $tx) = @_;
                                                 $r{bad_key} = (($tx->res->code // 0) == 401);
 
-                                                # client token scoped to another channel -> 403
                                                 get_token('mallory', $chan, sub {
                                                     my $bad = shift;
                                                     $ua->post("$base/publish" => { Authorization => "Bearer $bad" } => json => { channel => $room, data => 1 } => sub {
                                                         my ($ua, $tx) = @_;
                                                         $r{wrong_scope} = (($tx->res->code // 0) == 403);
 
-                                                        # client token for the right channel via Bearer header -> 200
                                                         get_token('rw', $room, sub {
                                                             my $good = shift;
                                                             $ua->post("$base/publish" => { Authorization => "Bearer $good" } => json => { channel => $room, data => 'ok' } => sub {
@@ -353,7 +348,6 @@ sub phase_dynamic {
             my @recv;
             $tx->on(message => sub {
                 my $m = decode_json($_[1]);
-                # ignore keepalive frames
                 return if $m->{ping};
                 push @recv, $m;
                 say "  [dave] channel=" . ($m->{channel} // '?') . " seq=" . ($m->{seq} // '?') . " " . ($m->{data} // '');
@@ -372,12 +366,15 @@ sub phase_dynamic {
             Mojo::IOLoop->timer(0.9 => sub {
                 get_token('publisher', $chan, sub {
                     my $t = shift;
-                    $ua->get("$base/publish?channel=$chan&msg=m7&token=$t" => sub {
-                        my ($ua, $r) = @_;
-                        my $body = $r->res->body // '';
-                        chomp $body;
-                        say "publish m7: $body";
-                    });
+                    $ua->post("$base/publish" =>
+                        { Authorization => "Bearer $t" } =>
+                        json => { channel => $chan, data => 'm7' } =>
+                        sub {
+                            my ($ua, $r) = @_;
+                            my $body = $r->res->body // '';
+                            chomp $body;
+                            say "publish m7: $body";
+                        });
                 });
             });
             Mojo::IOLoop->timer(1.4 => sub {
@@ -387,12 +384,15 @@ sub phase_dynamic {
             Mojo::IOLoop->timer(1.7 => sub {
                 get_token('publisher', $chan, sub {
                     my $t = shift;
-                    $ua->get("$base/publish?channel=$chan&msg=m8&token=$t" => sub {
-                        my ($ua, $r) = @_;
-                        my $body = $r->res->body // '';
-                        chomp $body;
-                        say "publish m8: $body";
-                    });
+                    $ua->post("$base/publish" =>
+                        { Authorization => "Bearer $t" } =>
+                        json => { channel => $chan, data => 'm8' } =>
+                        sub {
+                            my ($ua, $r) = @_;
+                            my $body = $r->res->body // '';
+                            chomp $body;
+                            say "publish m8: $body";
+                        });
                 });
             });
             Mojo::IOLoop->timer(2.2 => sub {

@@ -60,4 +60,26 @@ subtest 'authenticate without auth configured is anonymous' => sub {
     is $i->{bound_channel}, undef, 'no bound channel';
 };
 
+subtest 'server channels (#) denied for clients' => sub {
+    my $tok = $auth->make_token(user => 'alice', subscribe => ['*'], publish => ['*']);
+    my $i   = $hub->authenticate($tok);
+    ok !$hub->_allowed($i, '#internal', 'subscribe'), 'subscribe denied';
+    ok !$hub->_allowed($i, '#internal', 'publish'),   'publish denied';
+};
+
+subtest 'user channels ($) restricted to matching user' => sub {
+    my $alice = $hub->authenticate($auth->make_token(user => 'alice', subscribe => ['*']));
+    my $bob   = $hub->authenticate($auth->make_token(user => 'bob',   subscribe => ['*']));
+
+    ok  $hub->_allowed($alice, '$alice', 'subscribe'), 'alice → $alice';
+    ok !$hub->_allowed($alice, '$bob',   'subscribe'), 'alice ✗ $bob';
+    ok  $hub->_allowed($bob,   '$bob',   'subscribe'), 'bob → $bob';
+    ok !$hub->_allowed($bob,   '$alice', 'subscribe'), 'bob ✗ $alice';
+};
+
+subtest 'user channel still requires subscribe pattern' => sub {
+    my $i = $hub->authenticate($auth->make_token(user => 'alice'));  # no patterns
+    ok !$hub->_allowed($i, '$alice', 'subscribe'), 'no pattern → denied';
+};
+
 done_testing;

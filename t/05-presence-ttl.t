@@ -4,58 +4,9 @@ use Test::More;
 use lib 'lib';
 use Mojo::Centrifuge;
 
-# --- minimal mock Redis: records ZADD/ZREM/ZREMRANGEBYSCORE/ZRANGE calls ---
-{
-    package MockRedis;
-    sub new { bless { calls => [], zsets => {} }, shift }
-
-    sub db { shift }
-    sub pubsub { shift }
-
-    sub _rec { my ($self, $name, @args) = @_; push @{ $self->{calls} }, [ $name, @args ] }
-
-    sub zadd {
-        my ($self, $key, $score, $member) = @_;
-        $self->_rec('zadd', $key, $score, $member);
-        $self->{zsets}{$key}{$member} = $score;
-        return 1;
-    }
-    sub zrem {
-        my ($self, $key, $member) = @_;
-        $self->_rec('zrem', $key, $member);
-        delete $self->{zsets}{$key}{$member};
-        return 1;
-    }
-    sub zremrangebyscore {
-        my ($self, $key, $min, $max) = @_;
-        $self->_rec('zremrangebyscore', $key, $min, $max);
-        for my $m (keys %{ $self->{zsets}{$key} // {} }) {
-            my $s = $self->{zsets}{$key}{$m};
-            delete $self->{zsets}{$key}{$m} if $s < $max;
-        }
-        return 1;
-    }
-    sub zrange {
-        my ($self, $key, $start, $stop) = @_;
-        $self->_rec('zrange', $key, $start, $stop);
-        my @m = sort { $self->{zsets}{$key}{$a} <=> $self->{zsets}{$key}{$b} }
-                keys %{ $self->{zsets}{$key} // {} };
-        return \@m;
-    }
-    sub lpush { my ($s, $k, $v) = @_; $s->_rec('lpush', $k, $v); 1 }
-    sub ltrim { my ($s, $k, $a, $b) = @_; $s->_rec('ltrim', $k, $a, $b); 1 }
-    sub expire { my ($s, $k, $n) = @_; $s->_rec('expire', $k, $n); 1 }
-    sub incr { my ($s, $k) = @_; $s->_rec('incr', $k); 1 }
-    sub lrange { return [] }
-    sub smembers { return [] }
-    sub sadd { 1 }
-    sub srem { 1 }
-
-    sub calls { $_[0]{calls} }
-
-    sub listen { my ($self, $ch, $cb) = @_; $self->_rec('listen', $ch); return 1 }
-    sub notify { my ($self, $ch, $msg) = @_; $self->_rec('notify', $ch, $msg); return 1 }
-}
+use lib 'lib', 't/lib';
+use Test::MockRedis;
+my $redis = Test::MockRedis->new;
 
 {
     package MockTx;
@@ -75,7 +26,6 @@ use Mojo::Centrifuge;
     sub rendered { 1 }
 }
 
-my $redis = MockRedis->new;
 my $hub   = Mojo::Centrifuge->new(redis => $redis, presence_ttl => 60);
 
 sub zadd_calls { grep { $_->[0] eq 'zadd' } @{ $redis->calls } }

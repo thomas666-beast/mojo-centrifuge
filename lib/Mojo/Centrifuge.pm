@@ -6,7 +6,7 @@ use Mojo::Centrifuge::Auth;
 use Mojo::Centrifuge::Protocol;
 use Mojo::Centrifuge::Protocol qw(:codes);
 
-our $VERSION = '0.21';
+our $VERSION = '0.30';
 
 has 'log';
 has 'redis';
@@ -27,6 +27,60 @@ has 'auth';
 has 'proto'    => sub { Mojo::Centrifuge::Protocol->new };
 has '_node_id' => sub { sprintf "%d-%d", $$, int(rand(1_000_000)) };
 
+has 'epoch_key_ttl' => 0;   # if >0, epoch key expires (matches history TTL semantics); 0 = never
+has 'client_recover' => 1;  # global kill switch
+
+has 'client_channel_limit' => 128;
+has 'namespaces' => sub { {} };
+has 'epoch_key_ttl' => 0;
+
+sub _namespace_of {
+    my ($self, $channel) = @_;
+    return '' unless defined $channel && length $channel;
+    my $i = index($channel, ':');
+    return '' if $i < 0;
+    return substr($channel, 0, $i);
+}
+
+sub _channel_opts {
+    my ($self, $channel) = @_;
+    my $ns = $self->_namespace_of($channel);
+    my $ns_cfg = $self->namespaces->{$ns} // {};
+
+    return {
+        history_size         => $ns_cfg->{history_size}         // $self->history_size,
+        history_ttl          => $ns_cfg->{history_ttl}          // $self->history_ttl,
+        presence_ttl         => $ns_cfg->{presence_ttl}         // $self->presence_ttl,
+        presence             => $ns_cfg->{presence}             // 1,
+        presence_events      => $ns_cfg->{presence_events}      // $self->presence_events,
+        client_channel_limit => $ns_cfg->{client_channel_limit} // $self->client_channel_limit,
+        force_recover        => $ns_cfg->{force_recover}        // 0,
+        epoch_key_ttl        => $ns_cfg->{epoch_key_ttl}        // $self->epoch_key_ttl,
+    };
+}
+
+sub _epoch_key { my ($self, $ch) = @_; return $self->prefix . ":epoch:$ch" }
+
+sub _new_epoch {
+    my ($self, $ch) = @_;
+    my $e = sprintf "%d-%d-%d", time, $$, int(rand(1_000_000_000));
+    my $key = $self->_epoch_key($ch);
+    $self->redis->db->set($key, $e);
+    my $opts = $self->_channel_opts($ch);
+    $self->redis->db->expire($key, $opts->{epoch_key_ttl})
+        if $opts->{epoch_key_ttl} > 0;
+    return $e;
+}
+
+sub _current_epoch {
+    my ($self, $ch) = @_;
+    my $e = $self->redis->db->get($self->_epoch_key($ch));
+    return $e if defined $e && length $e;
+    return $self->_new_epoch($ch);
+}
+
+sub _reset_epoch { my ($self, $ch) = @_; return $self->_new_epoch($ch) }
+
 sub _valid_channel {
     my $ch = shift;
     return defined $ch && !ref $ch && length $ch && length $ch <= 255 ? 1 : 0;
@@ -41,10 +95,20 @@ sub _pubsub_ch    { my ($self, $ch) = @_; return $self->prefix . ":pubsub:$ch" }
 sub _presence_key { my ($self, $ch) = @_; return $self->prefix . ":presence:$ch" }
 
 sub _wire_pub {
-    my ($self, $channel, $seq, $data) = @_;
+    my ($self, $channel, $seq, $data, $tags) = @_;
     return $self->protocol eq 'legacy'
-        ? encode_json({ channel => $channel, seq => $seq, data => $data })
-        : $self->proto->push_frame(channel => $channel, seq => $seq, data => $data);
+        ? encode_json({
+            channel => $channel,
+            seq     => $seq,
+            data    => $data,
+            (ref $tags eq 'HASH' && keys %$tags ? (tags => $tags) : ()),
+          })
+        : $self->proto->push_frame(
+            channel => $channel,
+            seq     => $seq,
+            data    => $data,
+            tags    => $tags,
+          );
 }
 
 sub _wire_join_leave {
@@ -64,7 +128,9 @@ sub _wire_join_leave {
 
 sub _presence_event {
     my ($self, $channel, $event, $id, $user) = @_;
-    return unless $self->presence_events;
+
+    my $opts = $self->_channel_opts($channel);
+    return unless $opts->{presence_events};
 
     $self->_local_send($channel, $self->_wire_join_leave($channel, $event, $id, $user), $id);
     $self->redis->pubsub->notify(
@@ -110,6 +176,17 @@ sub _allowed {
     my ($self, $identity, $channel, $kind) = @_;
     return 0 unless $identity && ref $identity eq 'HASH';
 
+    # reserved prefixes
+    if ($self->_is_server_channel($channel)) {
+        return 0 if $kind eq 'subscribe' || $kind eq 'publish';
+        return 0;
+    }
+    if ($self->_is_user_channel($channel)) {
+        my $u = $self->_user_channel_of($channel);
+        my $me = $identity->{user} // '';
+        return 0 unless defined $u && $u ne '' && $u eq $me;
+    }
+
     my $raw = $identity->{raw} // {};
     my $patterns =
           $raw->{$kind}     ? $raw->{$kind}
@@ -123,6 +200,10 @@ sub _allowed {
     }
     return 0;
 }
+
+sub _is_server_channel { my ($self, $ch) = @_; return defined $ch && $ch =~ /^#/ }
+sub _is_user_channel   { my ($self, $ch) = @_; return defined $ch && $ch =~ /^\$/ }
+sub _user_channel_of   { my ($self, $ch) = @_; return $ch =~ /^\$([^:]+)/ ? $1 : undef }
 
 sub add_connection {
     my ($self, $c, $auto_channel, $since, $identity) = @_;
@@ -183,6 +264,7 @@ sub add_connection {
     }
 
     $self->_schedule_ping($id);
+    $self->_schedule_expiry($id);
 
     return $id;
 }
@@ -241,6 +323,14 @@ sub _on_message_legacy {
             $reply_error->(ERR_PERMISSION_DENIED, "not authorized for channel '$sub'");
             return;
         }
+
+    my $existing = $sess->{subscribed}{$sub} ? 1 : 0;
+    my $count    = scalar keys %{ $sess->{subscribed} // {} };
+    my $limit    = $self->_channel_opts($sub)->{client_channel_limit};
+    if (!$existing && $count >= $limit) {
+        return $reply_error->(ERR_BAD_SUBSCRIBE, "channel limit exceeded ($limit)");
+    }
+
         $self->subscribe($id, $sub, $cmd->{since});
     }
     elsif (my $unsub = $cmd->{unsubscribe}) {
@@ -259,6 +349,18 @@ sub _on_message_legacy {
             $reply_error->(ERR_BAD_PUBLISH, "publish requires 'data'");
             return;
         }
+
+        my $tags = $cmd->{tags};
+
+        if (defined $tags) {
+            unless (ref $tags eq 'HASH'
+                && !grep { ref $_ } values %$tags)
+            {
+                $reply_error->(ERR_BAD_PUBLISH, 'tags must be an object of scalars');
+                return;
+            }
+        }
+
         unless ($self->can_publish($id, $pub)) {
             $self->log->warn("Session $id denied publish to '$pub'") if $self->log;
             $reply_error->(ERR_PERMISSION_DENIED, "not authorized to publish to '$pub'");
@@ -313,10 +415,11 @@ sub _on_message_centrifuge {
     }
 
     if ($m eq 'connect') {
+        my $exp = $sess->{identity}{raw}{exp} // 0;
         return $reply->({
             client  => $self->_sid($id),
             version => $VERSION,
-            expires => 1,
+            expires => $exp,
             ping    => $self->ping_interval,
             pong    => $self->pong_timeout,
             server  => $self->_node_id,
@@ -328,8 +431,21 @@ sub _on_message_centrifuge {
         return $error->(ERR_BAD_SUBSCRIBE, 'bad channel') unless _valid_channel($ch);
         return $error->(ERR_PERMISSION_DENIED, "not authorized for channel '$ch'")
             unless $self->_allowed($sess->{identity}, $ch, 'subscribe');
-        $self->subscribe($id, $ch, $p->{since});
-        return $reply->({ channel => $ch });
+
+        # channel limit guard (Task 4)
+        my $existing = $sess->{subscribed}{$ch} ? 1 : 0;
+        my $count    = scalar keys %{ $sess->{subscribed} // {} };
+        my $limit    = $self->_channel_opts($ch)->{client_channel_limit};
+        if (!$existing && $count >= $limit) {
+            return $error->(ERR_BAD_SUBSCRIBE, "channel limit exceeded ($limit)");
+        }
+
+        my $res = $self->subscribe($id, $ch, $p->{since}, {
+            recover => $p->{recover},
+            epoch   => $p->{epoch},
+            offset  => $p->{offset},
+        });
+        return $reply->($res);
     }
 
     if ($m eq 'unsubscribe') {
@@ -353,9 +469,20 @@ sub _on_message_centrifuge {
         return $error->(ERR_BAD_PUBLISH, 'bad channel') unless _valid_channel($ch);
         return $error->(ERR_BAD_PUBLISH, "publish requires 'data'")
             unless exists $p->{data};
+
+        my $tags = $p->{tags};
+        if (defined $tags) {
+            return $error->(ERR_BAD_PUBLISH, 'tags must be an object')
+                unless ref $tags eq 'HASH';
+            for my $v (values %$tags) {
+                return $error->(ERR_BAD_PUBLISH, 'tags values must be scalars')
+                    if ref $v;
+            }
+        }
+
         return $error->(ERR_PERMISSION_DENIED, "not authorized to publish to '$ch'")
             unless $self->can_publish($id, $ch);
-        my $seq = eval { $self->publish($ch, $p->{data}) };
+        my $seq = eval { $self->publish($ch, $p->{data}, $tags) };
         return defined $seq
             ? $reply->({ channel => $ch, offset => $seq })
             : $error->(ERR_INTERNAL, 'publish failed');
@@ -368,7 +495,11 @@ sub _on_message_centrifuge {
         $sess->{identity}{raw}   = $new;
         $sess->{identity}{user}  = $new->{user} // 'anonymous';
         $sess->{identity}{token} = $tok;
-        return $reply->({ client => $self->_sid($id), expires => 1 });
+        $self->_schedule_expiry($id);       # re-arm with the new exp
+        return $reply->({
+            client  => $self->_sid($id),
+            expires => $new->{exp} // 0,
+        });
     }
 
     return $error->(ERR_UNKNOWN_METHOD, "unknown method '$m'");
@@ -413,31 +544,75 @@ sub _schedule_ping {
 }
 
 sub subscribe {
-    my ($self, $id, $channel, $since) = @_;
+    my ($self, $id, $channel, $since, $opts) = @_;
     return unless $channel && length $channel;
 
     my $sess = $self->connections->{$id} or return;
     my $tx   = $sess->{tx};
     return unless $tx && !$tx->is_finished;
 
+    my $co = $self->_channel_opts($channel);
+
     my $is_new = !$sess->{subscribed}{$channel};
     $sess->{subscribed}{$channel}++;
     $self->channels->{$channel}{$id} = $tx;
     $self->_ensure_subscribed($channel);
 
-    $self->redis->db->zadd(
-        $self->_presence_key($channel), time, $self->_member($id, $sess->{user}),
-    );
+    if ($co->{presence}) {
+        $self->redis->db->zadd(
+            $self->_presence_key($channel), time, $self->_member($id, $sess->{user}),
+        );
+    }
     $self->_presence_event($channel, 'join', $id, $sess->{user}) if $is_new;
 
-    $self->log->info("Session $id ($sess->{user}) subscribed to '$channel'") if $self->log;
+    $self->log->info("Session $id ($sess->{user}) subscribed to '$channel'")
+        if $self->log;
 
-    if (defined $since && $since =~ /^\d+$/) {
-        my @missed = @{ $self->history_for($channel, $since) };
-        for my $m (@missed) {
-            $tx->send($self->_wire_pub($channel, $m->{seq}, $m->{data}));
+    my $epoch = $self->_current_epoch($channel);
+
+    if (!defined $opts) {
+        if (defined $since && $since =~ /^\d+$/) {
+            for my $m (@{ $self->history_for($channel, $since) }) {
+                $tx->send($self->_wire_pub($channel, $m->{seq}, $m->{data}, $m->{tags}));
+            }
+        }
+        return { channel => $channel, epoch => $epoch };
+    }
+
+    my $head = $self->history_for($channel);
+    my $head_offset = @$head ? $head->[-1]{seq} : 0;
+
+    my $result = { channel => $channel, epoch => $epoch, offset => $head_offset };
+
+    my $want_recover = $opts->{recover} ? 1 : 0;
+    my $client_epoch = $opts->{epoch};
+    my $client_off   = $opts->{offset};
+    $client_off = $since
+        if !defined $client_off && defined $since && $since =~ /^\d+$/;
+
+    if ($want_recover && $self->client_recover
+        && defined $client_epoch && defined $client_off
+        && $client_epoch eq $epoch
+        && $client_off <= $head_offset)
+    {
+        my @missed   = grep { $_->{seq} > $client_off } @$head;
+        my $earliest = @$head ? $head->[0]{seq} : 0;
+
+        if (!@$head || $earliest <= $client_off + 1) {
+            $result->{recovered}    = Mojo::JSON->true;
+            $result->{publications} = [
+                map { { offset => $_->{seq}, data => $_->{data},
+                        (exists $_->{tags} ? (tags => $_->{tags}) : ()) } }
+                @missed
+            ];
+            $result->{offset} = $head_offset;
+            return $result;
         }
     }
+
+    $result->{recovered} = Mojo::JSON->false;
+    $result->{offset}    = 0 if !@$head;
+    return $result;
 }
 
 sub unsubscribe {
@@ -451,7 +626,14 @@ sub unsubscribe {
     delete $self->channels->{$channel}{$id};
     delete $self->channels->{$channel}
         unless keys %{ $self->channels->{$channel} // {} };
-    $self->redis->db->zrem($self->_presence_key($channel), $self->_member($id, $sess->{user}));
+
+    my $co = $self->_channel_opts($channel);
+    if ($co->{presence}) {
+        $self->redis->db->zrem(
+            $self->_presence_key($channel),
+            $self->_member($id, $sess->{user}),
+        );
+    }
     $self->_presence_event($channel, 'leave', $id, $sess->{user});
 
     $self->log->info("Session $id unsubscribed from '$channel'") if $self->log;
@@ -461,36 +643,52 @@ sub drop_session {
     my ($self, $id) = @_;
     my $sess = $self->connections->{$id} or return;
     delete $self->connections->{$id};
-    Mojo::IOLoop->remove($sess->{ping_timer}) if $sess->{ping_timer};
+    Mojo::IOLoop->remove($sess->{ping_timer})   if $sess->{ping_timer};
+    Mojo::IOLoop->remove($sess->{expiry_timer}) if $sess->{expiry_timer};
 
     for my $ch (keys %{ $sess->{subscribed} // {} }) {
         delete $self->channels->{$ch}{$id};
         delete $self->channels->{$ch}
             unless keys %{ $self->channels->{$ch} // {} };
-        $self->redis->db->zrem($self->_presence_key($ch), $self->_member($id, $sess->{user}));
+        my $co = $self->_channel_opts($ch);
+        if ($co->{presence}) {
+            $self->redis->db->zrem(
+                $self->_presence_key($ch),
+                $self->_member($id, $sess->{user}),
+            );
+        }
         $self->_presence_event($ch, 'leave', $id, $sess->{user});
     }
 }
 
 sub publish {
-    my ($self, $channel, $data) = @_;
+    my ($self, $channel, $data, $tags) = @_;
     $channel = 'default' unless defined $channel && length $channel;
 
-    my $seq = $self->redis->db->incr($self->_seq_key($channel));
+    my $opts = $self->_channel_opts($channel);
+    my $seq  = $self->redis->db->incr($self->_seq_key($channel));
 
-    my $redis_payload = encode_json({
+    my $pub = {
         seq     => $seq,
         data    => $data,
         channel => $channel,
         node    => $self->_node_id,
-    });
+    };
+    $pub->{tags} = $tags if ref $tags eq 'HASH' && keys %$tags;
+    my $redis_payload = encode_json($pub);
 
     my $hkey = $self->_history_key($channel);
+    my $llen_before = $self->redis->db->llen($hkey) // 0;
     $self->redis->db->lpush($hkey, $redis_payload);
-    $self->redis->db->ltrim($hkey, 0, $self->history_size - 1);
-    $self->redis->db->expire($hkey, $self->history_ttl) if $self->history_ttl > 0;
+    $self->redis->db->ltrim($hkey, 0, $opts->{history_size} - 1);
+    $self->redis->db->expire($hkey, $opts->{history_ttl})
+        if $opts->{history_ttl} > 0;
 
-    $self->_local_send($channel, $self->_wire_pub($channel, $seq, $data));
+    if ($llen_before >= $opts->{history_size}) {
+        $self->_reset_epoch($channel);
+    }
+
+    $self->_local_send($channel, $self->_wire_pub($channel, $seq, $data, $tags));
     $self->redis->pubsub->notify($self->_pubsub_ch($channel), $redis_payload);
 
     return $seq;
@@ -516,7 +714,12 @@ sub _ensure_subscribed {
 
         $self->_local_send(
             $channel,
-            $self->_wire_pub($m->{channel} // $channel, $m->{seq}, $m->{data}),
+            $self->_wire_pub(
+                $m->{channel} // $channel,
+                $m->{seq},
+                $m->{data},
+                $m->{tags},
+            ),
         );
     });
 }
@@ -547,7 +750,10 @@ sub history_for {
     my ($self, $channel, $since) = @_;
     $channel = 'default' unless defined $channel && length $channel;
 
-    my $raw = $self->redis->db->lrange($self->_history_key($channel), 0, $self->history_size - 1) // [];
+    my $opts = $self->_channel_opts($channel);
+    my $raw = $self->redis->db->lrange(
+        $self->_history_key($channel), 0, $opts->{history_size} - 1
+    ) // [];
     my @all = map { decode_json($_) } @$raw;
     @all = reverse @all;
 
@@ -559,9 +765,12 @@ sub presence {
     my ($self, $channel) = @_;
     $channel = 'default' unless defined $channel && length $channel;
 
+    my $opts = $self->_channel_opts($channel);
+    return [] unless $opts->{presence};   # presence disabled for this namespace
+
     my $key = $self->_presence_key($channel);
-    $self->redis->db->zremrangebyscore($key, '-inf', time - $self->presence_ttl)
-        if $self->presence_ttl > 0;
+    $self->redis->db->zremrangebyscore($key, '-inf', time - $opts->{presence_ttl})
+        if $opts->{presence_ttl} > 0;
 
     my $members = $self->redis->db->zrange($key, 0, -1) // [];
     my @users;
@@ -592,6 +801,7 @@ sub stats {
         my @ids = sort { $a <=> $b } keys %{ $self->channels->{$ch} };
         my $h   = $self->history_for($ch);
         $channels{$ch} = {
+            namespace   => $self->_namespace_of($ch),
             connections => scalar(@ids),
             ids         => \@ids,
             last_seq    => $h->[-1]{seq} // 0,
@@ -606,6 +816,48 @@ sub stats {
         timestamp   => time,
         version     => $VERSION,
     };
+}
+
+sub _schedule_expiry {
+    my ($self, $id) = @_;
+    my $sess = $self->connections->{$id} or return;
+
+    Mojo::IOLoop->remove($sess->{expiry_timer}) if $sess->{expiry_timer};
+
+    my $exp = $sess->{identity}{raw}{exp} // 0;
+    return unless $exp > 0;
+
+    my $now  = time;
+    my $wait = $exp - $now;
+
+    if ($wait <= 0) {
+        # Already expired: fire on next tick
+        $wait = 0.01;
+    }
+
+    $sess->{expiry_timer} = Mojo::IOLoop->timer($wait => sub {
+        my $s = $self->connections->{$id} or return;
+        my $cur_exp = $s->{identity}{raw}{exp} // 0;
+        my $now2    = time;
+
+        if ($cur_exp > $now2) {
+            # Refreshed between arm and fire: re-arm
+            $self->_schedule_expiry($id);
+            return;
+        }
+
+        $self->log->warn("Session $id: token expired, closing") if $self->log;
+
+        my $tx = $s->{tx};
+        if ($tx && !$tx->is_finished) {
+            my $frame = $self->protocol eq 'legacy'
+                ? encode_json({ error => { code => ERR_TOKEN_EXPIRED, message => 'expired' } })
+                : $self->proto->error_frame(undef, ERR_TOKEN_EXPIRED, 'expired');
+            eval { $tx->send($frame) };
+            eval { $tx->finish };
+        }
+        $self->drop_session($id);
+    });
 }
 
 1;
@@ -783,6 +1035,54 @@ C<timestamp>, C<version>.
 
 Alias for C<publish>. Returns the sequence number.
 
+=head2 namespaces
+
+  my $hub = Mojo::Centrifuge->new(
+      namespaces => {
+          chat => {
+              history_size         => 50,
+              history_ttl          => 3600,
+              presence             => 1,
+              presence_ttl         => 60,
+              presence_events      => 1,
+              client_channel_limit => 128,
+          },
+          notifications => {
+              history_size    => 20,
+              history_ttl     => 300,
+              presence        => 0,
+              presence_events => 0,
+          },
+      },
+  );
+
+Per-namespace overrides for the hub attributes of the same name. A
+channel's namespace is the substring before the first C<:>; a channel
+with no colon lives in the default namespace C<''>, governed by the
+hub attributes alone.
+
+Recognized keys: C<history_size>, C<history_ttl>, C<presence>,
+C<presence_ttl>, C<presence_events>, C<client_channel_limit>,
+C<epoch_key_ttl>. Absent keys inherit the hub value.
+
+=head2 client_channel_limit
+
+Maximum simultaneous subscriptions per WebSocket connection. Default
+C<128>. Attempting to exceed returns C<201 bad subscribe>. Overridable
+per-namespace.
+
+=head2 epoch_key_ttl
+
+Seconds after which a channel's epoch key expires. Default C<0>
+(never). When positive, set it E<gt>= C<history_ttl> for the same
+namespace or recovery will fail spuriously.
+
+=head2 client_recover
+
+When true (default), C<subscribe> with C<recover =E<gt> 1> honors
+recovery. Set to false to force all clients into a fresh epoch on
+reconnect (useful during incidents).
+
 =head2 channel_count
 
   my $n = $hub->channel_count($channel);
@@ -812,6 +1112,35 @@ Token permissions are evaluated with glob matching (C<*> and C<?>).
 Fallback chain per operation:
 
   <operation> (subscribe|publish) -> channels -> channel -> deny
+
+Two channel prefixes override the normal pattern match:
+
+=over 4
+
+=item * C<#> - server-only. Rejected for any client subscribe or
+publish attempt. Backend code may still use C<< $hub->publish('#x', ...) >>.
+
+=item * C<$user> - user-private. Only sessions whose token C<user>
+equals C<user> may subscribe. Publish authorization is unaffected.
+
+=back
+
+=head2 resolve_identity
+
+=head2 _channel_opts
+
+=head2 _namespace_of
+
+=head2 _current_epoch
+
+=head2 _reset_epoch
+
+=head2 _channel_opts
+
+  my $opts = $hub->_channel_opts($channel);
+
+Returns the effective configuration for C<$channel> after namespace
+overrides are applied.
 
 =head1 LICENSE
 

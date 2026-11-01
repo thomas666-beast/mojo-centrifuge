@@ -7,29 +7,9 @@ use Mojo::Centrifuge;
 use Mojo::Centrifuge::Auth;
 use Mojo::Centrifuge::Protocol qw(:codes);
 
-# Reuse the same mock classes as t/05; keep them self-contained so this
-# test file runs alone.
-{
-    package MockRedis;
-    sub new { bless { calls => [], zsets => {}, lists => {} }, shift }
-    sub db { shift }
-    sub pubsub { shift }
-    sub _rec { my ($s, $n, @a) = @_; push @{ $s->{calls} }, [ $n, @a ] }
-    sub zadd { my ($s,$k,$sc,$m)=@_; $s->_rec('zadd',$k,$sc,$m); $s->{zsets}{$k}{$m}=$sc; 1 }
-    sub zrem { my ($s,$k,$m)=@_; $s->_rec('zrem',$k,$m); delete $s->{zsets}{$k}{$m}; 1 }
-    sub zremrangebyscore { my ($s,$k,$a,$b)=@_; $s->_rec('zremrangebyscore',$k,$a,$b); 1 }
-    sub zrange { my ($s,$k)=@_; $s->_rec('zrange',$k,0,-1); return [ sort keys %{ $s->{zsets}{$k} // {} } ] }
-    sub lpush { my ($s,$k,$v)=@_; $s->_rec('lpush',$k,$v); unshift @{ $s->{lists}{$k} }, $v; 1 }
-    sub ltrim { my ($s,$k,$a,$b)=@_; $s->_rec('ltrim',$k,$a,$b); splice @{ $s->{lists}{$k} }, $b+1 if @{ $s->{lists}{$k} // [] } > $b+1; 1 }
-    sub lrange { my ($s,$k,$a,$b)=@_; my @l = @{ $s->{lists}{$k} // [] }; return \@l }
-    sub expire { my ($s,$k,$n)=@_; $s->_rec('expire',$k,$n); 1 }
-    sub incr { my ($s,$k)=@_; my $n = ($s->{seq}{$k} // 0) + 1; $s->{seq}{$k} = $n; $n }
-    sub sadd { 1 } sub srem { 1 } sub smembers { [] }
-    sub calls { $_[0]{calls} }
-
-    sub listen { my ($self, $ch, $cb) = @_; $self->_rec('listen', $ch); return 1 }
-    sub notify { my ($self, $ch, $msg) = @_; $self->_rec('notify', $ch, $msg); return 1 }
-}
+use lib 'lib', 't/lib';
+use Test::MockRedis;
+my $redis = Test::MockRedis->new;
 
 {
     package MockTx;
@@ -49,7 +29,6 @@ use Mojo::Centrifuge::Protocol qw(:codes);
     sub rendered { 1 }
 }
 
-my $redis = MockRedis->new;
 my $auth  = Mojo::Centrifuge::Auth->new(secret => 's');
 my $hub   = Mojo::Centrifuge->new(
     redis    => $redis,
@@ -195,6 +174,166 @@ subtest 'publish pushes wire-frame to subscriber' => sub {
     is $f->{push}{channel}, 'room/x';
     is_deeply $f->{push}{pub}{data}, { hi => 1 };
     ok defined $f->{push}{pub}{offset}, 'offset present';
+};
+
+subtest 'publish with tags → push carries tags' => sub {
+    my $sub_tx = MockTx->new;
+    my $sub_c  = MockC->new;
+    $sub_c->{tx} = $sub_tx;
+    my $sub_i  = $hub->authenticate($auth->make_token(user => 'bob', subscribe => ['room/*']));
+    my $sub_id = $hub->add_connection($sub_c, undef, undef, $sub_i);
+    $hub->subscribe($sub_id, 'room/t', undef);
+
+    $hub->publish('room/t', { hi => 1 }, { source => 'api', level => 'info' });
+
+    my ($raw) = grep { /"push"/ } @{ $sub_tx->sent };
+    my $f = decode_json($raw);
+    is_deeply $f->{push}{pub}{tags}, { source => 'api', level => 'info' };
+};
+
+subtest 'publish without tags omits tags key' => sub {
+    my $sub_tx = MockTx->new;
+    my $sub_c  = MockC->new;
+    $sub_c->{tx} = $sub_tx;
+    my $sub_i  = $hub->authenticate($auth->make_token(user => 'bob', subscribe => ['room/*']));
+    my $sub_id = $hub->add_connection($sub_c, undef, undef, $sub_i);
+    $hub->subscribe($sub_id, 'room/u', undef);
+
+    $hub->publish('room/u', { hi => 1 });
+
+    my ($raw) = grep { /"push"/ } @{ $sub_tx->sent };
+    my $f = decode_json($raw);
+    ok !exists $f->{push}{pub}{tags}, 'no tags key';
+};
+
+subtest 'client publish with bad tags → 202' => sub {
+    my ($id, $tx) = new_sess(publish => ['room/*']);
+    $hub->_on_message_centrifuge($id, $tx, encode_json({
+        id => 11,
+        publish => { channel => 'room/x', data => 1, tags => [ 'not', 'hash' ] },
+    }));
+    my $f = decode_json($tx->sent->[-1]);
+    is $f->{error}{code}, ERR_BAD_PUBLISH;
+};
+
+subtest 'client publish with nested tag → 202' => sub {
+    my ($id, $tx) = new_sess(publish => ['room/*']);
+    $hub->_on_message_centrifuge($id, $tx, encode_json({
+        id => 12,
+        publish => { channel => 'room/x', data => 1, tags => { a => { b => 1 } } },
+    }));
+    my $f = decode_json($tx->sent->[-1]);
+    is $f->{error}{code}, ERR_BAD_PUBLISH;
+};
+
+subtest 'channel limit: N-th subscribe OK, N+1 → 201' => sub {
+    my $hub2 = Mojo::Centrifuge->new(
+        redis                => Test::MockRedis->new,
+        auth                 => $auth,
+        protocol             => 'centrifuge',
+        client_channel_limit => 2,
+    );
+    my $tok = $auth->make_token(user => 'alice', subscribe => ['room/*']);
+    my $c   = MockC->new;
+    my $id  = $hub2->add_connection($c, undef, undef, $hub2->authenticate($tok));
+
+    $hub2->_on_message_centrifuge($id, $c->tx,
+        encode_json({ id => 1, subscribe => { channel => 'room/a' } }));
+    is decode_json($c->tx->sent->[-1])->{result}{channel}, 'room/a';
+
+    $hub2->_on_message_centrifuge($id, $c->tx,
+        encode_json({ id => 2, subscribe => { channel => 'room/b' } }));
+    is decode_json($c->tx->sent->[-1])->{result}{channel}, 'room/b';
+
+    $hub2->_on_message_centrifuge($id, $c->tx,
+        encode_json({ id => 3, subscribe => { channel => 'room/c' } }));
+    my $f = decode_json($c->tx->sent->[-1]);
+    is $f->{id}, 3;
+    is $f->{error}{code}, ERR_BAD_SUBSCRIBE;
+    like $f->{error}{message}, qr/channel limit exceeded/;
+};
+
+subtest 'channel limit: re-subscribe to existing channel OK at limit' => sub {
+    my $hub2 = Mojo::Centrifuge->new(
+        redis                => Test::MockRedis->new,
+        auth                 => $auth,
+        protocol             => 'centrifuge',
+        client_channel_limit => 1,
+    );
+    my $tok = $auth->make_token(user => 'alice', subscribe => ['room/*']);
+    my $c   = MockC->new;
+    my $id  = $hub2->add_connection($c, undef, undef, $hub2->authenticate($tok));
+
+    $hub2->_on_message_centrifuge($id, $c->tx,
+        encode_json({ id => 1, subscribe => { channel => 'room/a' } }));
+
+    # At limit (1). Re-subscribe to room/a should succeed.
+    $hub2->_on_message_centrifuge($id, $c->tx,
+        encode_json({ id => 2, subscribe => { channel => 'room/a' } }));
+    my $f = decode_json($c->tx->sent->[-1]);
+    is $f->{id}, 2;
+    is $f->{result}{channel}, 'room/a';
+    ok !exists $f->{error}, 'no error';
+};
+
+subtest 'channel limit: unsubscribe frees a slot' => sub {
+    my $hub2 = Mojo::Centrifuge->new(
+        redis                => Test::MockRedis->new,
+        auth                 => $auth,
+        protocol             => 'centrifuge',
+        client_channel_limit => 1,
+    );
+    my $tok = $auth->make_token(user => 'alice', subscribe => ['room/*']);
+    my $c   = MockC->new;
+    my $id  = $hub2->add_connection($c, undef, undef, $hub2->authenticate($tok));
+
+    $hub2->_on_message_centrifuge($id, $c->tx,
+        encode_json({ id => 1, subscribe => { channel => 'room/a' } }));
+
+    $hub2->_on_message_centrifuge($id, $c->tx,
+        encode_json({ id => 2, unsubscribe => { channel => 'room/a' } }));
+
+    $hub2->_on_message_centrifuge($id, $c->tx,
+        encode_json({ id => 3, subscribe => { channel => 'room/b' } }));
+    my $f = decode_json($c->tx->sent->[-1]);
+    is $f->{id}, 3;
+    is $f->{result}{channel}, 'room/b';
+    ok !exists $f->{error}, 'no error';
+};
+
+subtest 'channel limit: legacy envelope' => sub {
+    my $hub2 = Mojo::Centrifuge->new(
+        redis                => Test::MockRedis->new,
+        auth                 => $auth,
+        protocol             => 'legacy',
+        client_channel_limit => 1,
+    );
+    my $tok = $auth->make_token(user => 'alice', subscribe => ['room/*']);
+    my $c   = MockC->new;
+    my $id  = $hub2->add_connection($c, undef, undef, $hub2->authenticate($tok));
+
+    $hub2->_on_message_legacy($id, $c->tx,
+        encode_json({ subscribe => 'room/a', id => 1 }));
+
+    $hub2->_on_message_legacy($id, $c->tx,
+        encode_json({ subscribe => 'room/b', id => 2 }));
+    my $f = decode_json($c->tx->sent->[-1]);
+    is $f->{id}, 2;
+    is $f->{error}{code}, ERR_BAD_SUBSCRIBE;
+};
+
+subtest 'client publish to #server channel → 103' => sub {
+    my ($id, $tx) = new_sess(publish => ['*'], subscribe => ['*']);
+    $hub->_on_message_centrifuge($id, $tx,
+        encode_json({ id => 50, publish => { channel => '#x', data => 1 } }));
+    is decode_json($tx->sent->[-1])->{error}{code}, ERR_PERMISSION_DENIED;
+};
+
+subtest 'client subscribe to #server channel → 103' => sub {
+    my ($id, $tx) = new_sess(subscribe => ['*']);
+    $hub->_on_message_centrifuge($id, $tx,
+        encode_json({ id => 51, subscribe => { channel => '#x' } }));
+    is decode_json($tx->sent->[-1])->{error}{code}, ERR_PERMISSION_DENIED;
 };
 
 done_testing;

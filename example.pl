@@ -14,11 +14,27 @@ app->log->warn('CENTRIFUGE_API_KEY not set; using the insecure dev default')
 
 my $redis = Mojo::Redis->new('redis://127.0.0.1:6379/0');
 my $auth  = Mojo::Centrifuge::Auth->new(secret => $SECRET);
-my $hub   = Mojo::Centrifuge->new(
-    log    => app->log,
-    redis  => $redis,
-    prefix => 'centrifuge',
-    auth   => $auth,
+my $hub = Mojo::Centrifuge->new(
+    log                  => app->log,
+    redis                => $redis,
+    prefix               => 'centrifuge',
+    auth                 => $auth,
+    client_channel_limit => 128,
+    namespaces           => {
+        chat => {
+            history_size    => 50,
+            history_ttl     => 3600,
+            presence        => 1,
+            presence_ttl    => 60,
+            presence_events => 1,
+        },
+        notifications => {
+            history_size    => 20,
+            history_ttl     => 300,
+            presence        => 0,
+            presence_events => 0,
+        },
+    },
 );
 
 get '/token' => sub {
@@ -71,37 +87,164 @@ sub _is_api_caller {
     return defined $given && length $given && secure_compare($given, $API_KEY);
 }
 
-any ['GET', 'POST'] => '/publish' => sub {
+sub _require_api {
+    my $c = shift;
+    unless (_is_api_caller($c)) {
+        $c->render(status => 401, text => "unauthorized\n");
+        return 0;
+    }
+    return 1;
+}
+
+sub _body_json {
+    my $c = shift;
+    my $b = $c->req->json;
+    return ref $b eq 'HASH' ? $b : {};
+}
+
+post '/publish' => sub {
     my $c = shift;
 
     my $body = $c->req->json;
-    my $json_mode = defined $body;
-    $body = {} unless ref $body eq 'HASH';
+    return $c->render(status => 400, text => "json body required\n")
+        unless ref $body eq 'HASH';
 
-    my $channel = $body->{channel} // $c->param('channel') // 'default';
-    if (ref $channel || !length $channel) {
-        return $c->render(status => 400, text => "bad channel\n");
-    }
+    my $channel = $body->{channel};
+    return $c->render(status => 400, text => "bad channel\n")
+        unless defined $channel && !ref $channel && length $channel;
 
     unless (_is_api_caller($c)) {
         my $identity = $hub->authenticate($c->param('token') // _bearer($c));
         return $c->render(status => 401, text => "unauthorized\n") unless $identity;
         unless ($hub->authorize_publish($identity, $channel)) {
-            return $c->render(
-                status => 403,
-                text   => "forbidden: token not allowed to publish to '$channel'\n",
-            );
+            return $c->render(status => 403,
+                text => "forbidden: token not allowed to publish to '$channel'\n");
         }
     }
 
-    my $data = exists $body->{data}
-        ? $body->{data}
-        : "Server broadcast: " . ($c->param('msg') // 'hello');
+    my $tags = ref $body->{tags} eq 'HASH' ? $body->{tags} : undef;
+    my $seq  = $hub->publish($channel, $body->{data}, $tags);
+    $c->render(json => { seq => $seq, channel => $channel,
+        ($tags ? (tags => $tags) : ()) });
+};
 
-    my $seq = $hub->publish($channel, $data);
-    return $json_mode
-        ? $c->render(json => { seq => $seq, channel => $channel })
-        : $c->render(text => "Published seq=$seq on '$channel'\n");
+post '/api/publish' => sub {
+    my $c = shift;
+    return unless _require_api($c);
+
+    my $b = _body_json($c);
+    my $ch = $b->{channel};
+    return $c->render(status => 400, json => { error => 'channel required' })
+        unless defined $ch && !ref $ch && length $ch;
+
+    my $tags = ref $b->{tags} eq 'HASH' ? $b->{tags} : undef;
+    my $seq = $hub->publish($ch, $b->{data}, $tags);
+    $c->render(json => { seq => $seq, channel => $ch, ($tags ? (tags => $tags) : ()) });
+};
+
+post '/api/broadcast' => sub {
+    my $c = shift;
+    return unless _require_api($c);
+
+    my $b = _body_json($c);
+    my $channels = $b->{channels};
+    return $c->render(status => 400, json => { error => 'channels array required' })
+        unless ref $channels eq 'ARRAY' && @$channels;
+
+    my @results;
+    for my $ch (@$channels) {
+        next unless defined $ch && !ref $ch && length $ch;
+        my $tags = ref $b->{tags} eq 'HASH' ? $b->{tags} : undef;
+        push @results, { channel => $ch, seq => $hub->publish($ch, $b->{data}, $tags) };
+    }
+    $c->render(json => { results => \@results });
+};
+
+post '/api/history' => sub {
+    my $c = shift;
+    return unless _require_api($c);
+
+    my $b = _body_json($c);
+    my $ch = $b->{channel} // 'default';
+    my $since = $b->{since};
+    my $limit = $b->{limit};
+
+    my $pub = $hub->history_for($ch, $since);
+    if (defined $limit && $limit =~ /^\d+$/ && $limit > 0) {
+        $pub = [ @$pub[ -$limit .. -1 ] ] if @$pub > $limit;
+    }
+    $c->render(json => { channel => $ch, publications => $pub });
+};
+
+post '/api/presence' => sub {
+    my $c = shift;
+    return unless _require_api($c);
+
+    my $b = _body_json($c);
+    my $ch = $b->{channel} // 'default';
+    $c->render(json => { channel => $ch, presence => $hub->presence($ch) });
+};
+
+post '/api/channels' => sub {
+    my $c = shift;
+    return unless _require_api($c);
+
+    my $stats = $hub->stats;
+    my @out;
+    for my $ch (sort keys %{ $stats->{channels} }) {
+        push @out, {
+            channel     => $ch,
+            num_clients => $stats->{channels}{$ch}{connections},
+        };
+    }
+    $c->render(json => { channels => \@out });
+};
+
+post '/api/unsubscribe' => sub {
+    my $c = shift;
+    return unless _require_api($c);
+
+    my $b = _body_json($c);
+    my $ch = $b->{channel};
+    return $c->render(status => 400, json => { error => 'channel required' })
+        unless defined $ch && length $ch;
+
+    my $target = $b->{client};   # optional: only this client id
+    my $subs = $hub->channels->{$ch} // {};
+    my @kicked;
+    for my $id (keys %$subs) {
+        next if defined $target && $id ne $target;
+        $hub->unsubscribe($id, $ch);
+        push @kicked, $id;
+    }
+    $c->render(json => { channel => $ch, unsubscribed => \@kicked });
+};
+
+post '/api/disconnect' => sub {
+    my $c = shift;
+    return unless _require_api($c);
+
+    my $b = _body_json($c);
+    my $client = $b->{client};
+    my $user   = $b->{user};
+
+    my @kicked;
+    for my $id (keys %{ $hub->connections }) {
+        my $s = $hub->connections->{$id};
+        next if defined $client && $id ne $client;
+        next if defined $user   && ($s->{user} // '') ne $user;
+        next unless defined $client || defined $user;
+        my $tx = $s->{tx};
+        eval { $tx->finish } if $tx && !$tx->is_finished;
+        $hub->drop_session($id);
+        push @kicked, $id;
+    }
+    $c->render(json => { disconnected => \@kicked });
+};
+
+get '/api/status' => sub {
+    my $c = shift;
+    $c->render(json => $hub->stats);
 };
 
 get '/history' => sub {
@@ -115,11 +258,6 @@ get '/presence' => sub {
     my $c       = shift;
     my $channel = $c->param('channel') // 'default';
     $c->render(json => $hub->presence($channel));
-};
-
-get '/status' => sub {
-    my $c = shift;
-    $c->render(json => $hub->stats);
 };
 
 app->start;
@@ -139,16 +277,20 @@ example.pl - Minimal Mojolicious app demonstrating Mojo::Centrifuge
 
 Boots a Mojolicious::Lite app with the following endpoints:
 
-  GET  /token      issue a client token (user, channel, channels,
-                   subscribe, publish, ttl)
-  WS   /ws         WebSocket endpoint (pre-upgrade auth; real 401 on failure)
-  GET|POST /publish  publish to a channel. Two callers accepted:
-                     - X-API-Key / Bearer <api_key>  (backend, any channel)
-                     - Bearer <token> / ?token=      (client, checked
-                       against authorize_publish)
-  GET  /history    list the retained history of a channel
-  GET  /presence   list the current members of a channel
-  GET  /status     runtime counters
+  GET  /token          issue a client token
+  WS   /ws             WebSocket (pre-upgrade auth, real 401)
+  POST /publish        backend or client publish (JSON body)
+  GET  /history        read-only history shim (demo only)
+  GET  /presence       read-only presence shim (demo only)
+
+  POST /api/publish    backend publish        (X-API-Key / Bearer <api_key>)
+  POST /api/broadcast  publish to many channels
+  POST /api/history    read history           (with optional since/limit)
+  POST /api/presence   read presence
+  POST /api/channels   list channels + client counts
+  POST /api/unsubscribe remove sessions from a channel
+  POST /api/disconnect  close sessions (by client id or user)
+  GET  /api/status     runtime counters
 
 This script is an example only; it is B<not> installed by
 C<Makefile.PL>.

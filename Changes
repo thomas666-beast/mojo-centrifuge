@@ -1,5 +1,26 @@
 Revision history for Mojo-Centrifuge
 
+0.30  2026-11-01
+    - Epoch + recover semantics: subscribe accepts {recover, epoch,
+      offset} and returns {epoch, recovered, offset, publications?}
+    - Publications carry optional tags; wire, history, and recover
+      replay all preserve them
+    - connect result returns real token expires (epoch seconds, 0 =
+      never); expired tokens close the session with error 109
+    - client_channel_limit (default 128) per connection, per namespace
+    - namespaces attribute: per-family history_size, history_ttl,
+      presence, presence_ttl, presence_events, client_channel_limit,
+      epoch_key_ttl
+    - Reserved channel prefixes: # (server-only) and $user (private)
+    - Server API: POST /api/publish, /api/broadcast, /api/history,
+      /api/presence, /api/channels, /api/unsubscribe, /api/disconnect,
+      GET /api/status
+    - Legacy /publish is POST + JSON only
+    - Fix: _namespace_of('room1') returned 'room1' instead of ''
+    - Fix: connect.expires hardcoded to 1
+    - Tests: t/08-epoch.t, t/09-expiry.t, t/10-namespaces.t added;
+      t/basic.t is now a real API integration test
+
 0.21  2026-10-31
         - Phase 2: wired Mojo::Centrifuge::Protocol into the WebSocket
           handler. `protocol => 'centrifuge'` now speaks the Centrifugo
