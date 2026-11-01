@@ -1,4 +1,4 @@
-Revision history for Mojo-Centrifuge
+Revision history for Mojo::Centrifuge
 
 0.30  2026-11-01
     - Epoch + recover semantics: subscribe accepts {recover, epoch,
@@ -10,16 +10,23 @@ Revision history for Mojo-Centrifuge
     - client_channel_limit (default 128) per connection, per namespace
     - namespaces attribute: per-family history_size, history_ttl,
       presence, presence_ttl, presence_events, client_channel_limit,
-      epoch_key_ttl
+      force_recover, epoch_key_ttl
     - Reserved channel prefixes: # (server-only) and $user (private)
+    - Rate limits: publish_rate_limit, message_rate_limit
+      (per connection, per second, default 0 = unlimited)
     - Server API: POST /api/publish, /api/broadcast, /api/history,
       /api/presence, /api/channels, /api/unsubscribe, /api/disconnect,
-      GET /api/status
+      /api/info, /api/history_remove, /api/revoke; GET /api/status
+    - Prometheus /metrics endpoint
+    - New methods: channel_info, history_remove, revoke_user,
+      channel_stats
+    - Routes extracted to Mojo::Centrifuge::ExampleApp so example.pl
+      and t/basic.t share one definition
     - Legacy /publish is POST + JSON only
     - Fix: _namespace_of('room1') returned 'room1' instead of ''
     - Fix: connect.expires hardcoded to 1
-    - Tests: t/08-epoch.t, t/09-expiry.t, t/10-namespaces.t added;
-      t/basic.t is now a real API integration test
+    - Tests: t/08-epoch.t, t/09-expiry.t, t/10-namespaces.t,
+      t/11-rate.t added; t/basic.t is now a real API integration test
 
 0.21  2026-10-31
         - Phase 2: wired Mojo::Centrifuge::Protocol into the WebSocket

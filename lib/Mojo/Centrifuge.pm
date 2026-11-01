@@ -30,6 +30,9 @@ has '_node_id' => sub { sprintf "%d-%d", $$, int(rand(1_000_000)) };
 has 'epoch_key_ttl' => 0;   # if >0, epoch key expires (matches history TTL semantics); 0 = never
 has 'client_recover' => 1;  # global kill switch
 
+has 'publish_rate_limit' => 0;
+has 'message_rate_limit' => 0;
+
 has 'client_channel_limit' => 128;
 has 'namespaces' => sub { {} };
 has 'epoch_key_ttl' => 0;
@@ -56,6 +59,7 @@ sub _channel_opts {
         client_channel_limit => $ns_cfg->{client_channel_limit} // $self->client_channel_limit,
         force_recover        => $ns_cfg->{force_recover}        // 0,
         epoch_key_ttl        => $ns_cfg->{epoch_key_ttl}        // $self->epoch_key_ttl,
+        force_recover        => $ns_cfg->{force_recover}        // 0,
     };
 }
 
@@ -279,6 +283,15 @@ sub _error_payload {
 sub _on_message_legacy {
     my ($self, $id, $tx, $raw) = @_;
 
+    my $sess = $self->connections->{$id} or return;
+
+    unless ($self->_rate_ok($sess, 'message', $self->message_rate_limit)) {
+        $self->log->warn("Session $id: message rate limit exceeded, closing") if $self->log;
+        eval { $tx->finish };
+        $self->drop_session($id);
+        return;
+    }
+
     my $cmd = eval { decode_json($raw) };
     unless (ref $cmd eq 'HASH') {
         $self->log->warn("Session $id sent non-object message") if $self->log;
@@ -315,8 +328,6 @@ sub _on_message_legacy {
         return;
     }
 
-    my $sess = $self->connections->{$id} or return;
-
     if (my $sub = $cmd->{subscribe}) {
         unless ($self->_allowed($sess->{identity}, $sub, 'subscribe')) {
             $self->log->warn("Session $id denied subscribe to '$sub'") if $self->log;
@@ -347,6 +358,11 @@ sub _on_message_legacy {
     elsif (my $pub = $cmd->{publish}) {
         unless (exists $cmd->{data}) {
             $reply_error->(ERR_BAD_PUBLISH, "publish requires 'data'");
+            return;
+        }
+
+        unless ($self->_rate_ok($sess, 'publish', $self->publish_rate_limit)) {
+            $reply_error->(ERR_PERMISSION_DENIED, 'publish rate limit exceeded');
             return;
         }
 
@@ -383,8 +399,16 @@ sub _on_message_legacy {
 sub _on_message_centrifuge {
     my ($self, $id, $tx, $raw) = @_;
 
-    my $f = $self->proto->decode_frame($raw);
     my $sess = $self->connections->{$id} or return;
+
+    unless ($self->_rate_ok($sess, 'message', $self->message_rate_limit)) {
+        $self->log->warn("Session $id: message rate limit exceeded, closing") if $self->log;
+        eval { $tx->finish };
+        $self->drop_session($id);
+        return;
+    }
+
+    my $f = $self->proto->decode_frame($raw);
 
     unless ($f) {
         $tx->send($self->proto->error_frame(undef, ERR_BAD_REQUEST, 'bad request'));
@@ -483,6 +507,11 @@ sub _on_message_centrifuge {
         return $error->(ERR_PERMISSION_DENIED, "not authorized to publish to '$ch'")
             unless $self->can_publish($id, $ch);
         my $seq = eval { $self->publish($ch, $p->{data}, $tags) };
+
+        unless ($self->_rate_ok($sess, 'publish', $self->publish_rate_limit)) {
+            return $error->(ERR_PERMISSION_DENIED, 'publish rate limit exceeded');
+        }
+
         return defined $seq
             ? $reply->({ channel => $ch, offset => $seq })
             : $error->(ERR_INTERNAL, 'publish failed');
@@ -508,6 +537,19 @@ sub _on_message_centrifuge {
 sub authorize_publish {
     my ($self, $identity, $channel) = @_;
     return $self->_allowed($identity, $channel, 'publish');
+}
+
+sub channel_stats {
+    my ($self, $channel) = @_;
+    $channel = 'default' unless defined $channel && length $channel;
+
+    my $info = $self->channel_info($channel);
+    my $pres = $self->presence($channel);
+
+    return {
+        %$info,
+        presence_users => scalar @$pres,
+    };
 }
 
 sub can_publish {
@@ -541,6 +583,23 @@ sub _schedule_ping {
         $sess->{awaiting_pong} = 1;
     });
     $self->connections->{$id}{ping_timer} = $timer if $self->connections->{$id};
+}
+
+sub _rate_ok {
+    my ($self, $sess, $kind, $limit) = @_;
+    return 1 unless $limit && $limit > 0;
+
+    my $now = time;
+    my $slot = $kind eq 'publish' ? 'pub' : 'msg';
+    my $bucket = $sess->{rate}{$slot} //= { second => $now, count => 0 };
+
+    if ($bucket->{second} != $now) {
+        $bucket->{second} = $now;
+        $bucket->{count}  = 0;
+    }
+
+    $bucket->{count}++;
+    return $bucket->{count} <= $limit ? 1 : 0;
 }
 
 sub subscribe {
@@ -579,12 +638,14 @@ sub subscribe {
         return { channel => $channel, epoch => $epoch };
     }
 
-    my $head = $self->history_for($channel);
+    my $head        = $self->history_for($channel);
     my $head_offset = @$head ? $head->[-1]{seq} : 0;
 
     my $result = { channel => $channel, epoch => $epoch, offset => $head_offset };
 
     my $want_recover = $opts->{recover} ? 1 : 0;
+    $want_recover = 1 if $co->{force_recover};
+
     my $client_epoch = $opts->{epoch};
     my $client_off   = $opts->{offset};
     $client_off = $since
@@ -637,6 +698,64 @@ sub unsubscribe {
     $self->_presence_event($channel, 'leave', $id, $sess->{user});
 
     $self->log->info("Session $id unsubscribed from '$channel'") if $self->log;
+}
+
+sub channel_info {
+    my ($self, $channel) = @_;
+    $channel = 'default' unless defined $channel && length $channel;
+
+    my $subs = $self->channels->{$channel} // {};
+    my %users;
+    for my $id (keys %$subs) {
+        my $s = $self->connections->{$id} or next;
+        $users{ $s->{user} // 'anonymous' }++;
+    }
+
+    my $h = $self->history_for($channel);
+
+    return {
+        channel        => $channel,
+        num_clients    => scalar keys %$subs,
+        num_users      => scalar keys %users,
+        history_length => scalar @$h,
+        last_offset    => @$h ? $h->[-1]{seq} : 0,
+        epoch          => $self->_current_epoch($channel),
+    };
+}
+
+sub history_remove {
+    my ($self, $channel) = @_;
+    $channel = 'default' unless defined $channel && length $channel;
+
+    my $hkey = $self->_history_key($channel);
+    my $n = $self->redis->db->llen($hkey) // 0;
+    $self->redis->db->del($hkey);
+    $self->redis->db->del($self->_seq_key($channel));
+    $self->redis->db->del($self->_epoch_key($channel));
+    return $n;
+}
+
+sub revoke_user {
+    my ($self, $user) = @_;
+    return [] unless defined $user && length $user;
+
+    my @kicked;
+    for my $id (keys %{ $self->connections }) {
+        my $s = $self->connections->{$id} or next;
+        next unless ($s->{user} // '') eq $user;
+
+        my $tx = $s->{tx};
+        if ($tx && !$tx->is_finished) {
+            my $frame = $self->protocol eq 'legacy'
+                ? encode_json({ error => { code => ERR_TOKEN_EXPIRED, message => 'revoked' } })
+                : $self->proto->error_frame(undef, ERR_TOKEN_EXPIRED, 'revoked');
+            eval { $tx->send($frame) };
+            eval { $tx->finish };
+        }
+        $self->drop_session($id);
+        push @kicked, $id;
+    }
+    return \@kicked;
 }
 
 sub drop_session {
@@ -882,23 +1001,104 @@ Mojo::Centrifuge - Centrifugo-like realtime pub/sub for Mojolicious
       redis    => $redis,
       auth     => $auth,
       protocol => 'centrifuge',
+      namespaces => {
+          chat => {
+              history_size    => 200,
+              history_ttl     => 3600,
+              presence        => 1,
+              presence_events => 1,
+          },
+      },
   );
 
   websocket '/ws' => sub {
       my $c = shift;
       my $identity = $hub->authenticate($c->param('token'))
           or return $c->render(status => 401, text => "unauthorized\n");
-      $hub->add_connection($c, $c->param('channel'), $c->param('since'), $identity);
+      $hub->add_connection(
+          $c,
+          $c->param('channel'),
+          $c->param('since'),
+          $identity,
+      );
   };
 
 =head1 DESCRIPTION
 
-A Redis-backed realtime pub/sub server. Supports subscribe/unsubscribe,
-history with C<since> replay, presence, keepalive ping/pong, client
-publish with per-channel authorization, and multi-node fan-out via
-Redis pub/sub. Two wire formats are available: C<'legacy'> (the
-envelope used before 0.21) and C<'centrifuge'> (Centrifugo JSON
-protocol, via L<Mojo::Centrifuge::Protocol>).
+A Redis-backed realtime pub/sub server for Mojolicious, modeled on
+L<Centrifugo|https://centrifugal.dev>.
+
+Supported: client tokens with glob-based per-channel permissions,
+WebSocket handshake with pre-upgrade C<401>, subscribe/unsubscribe,
+per-channel history with C<since> replay and C<epoch>/C<recover>
+recovery semantics, presence (snapshot + join/leave events), keepalive
+ping/pong with timeout, client-side publish with per-channel
+authorization, backend publish via API key, per-namespace configuration,
+reserved C<#> and C<$user> channel prefixes, and multi-node fan-out via
+Redis pub/sub.
+
+Two wire formats are available:
+
+=over 4
+
+=item * C<'legacy'> (default) - the pre-0.21 envelope,
+C<{channel, seq, data}> for pushes and C<{subscribe: "ch"}> for
+commands.
+
+=item * C<'centrifuge'> - the Centrifugo JSON protocol, via
+L<Mojo::Centrifuge::Protocol>. Frames are
+C<{id, method: {params}}> upstream and
+C<{push: {...}}> / C<{id, result}> / C<{id, error}> downstream.
+
+=back
+
+=head1 PROTOCOL
+
+=head2 Centrifugo frames
+
+Client to server:
+
+  { "id": N, "connect":     {} }
+  { "id": N, "subscribe":   { "channel": "ch", "recover": true, "epoch": "...", "offset": N } }
+  { "id": N, "unsubscribe": { "channel": "ch" } }
+  { "id": N, "publish":     { "channel": "ch", "data": ..., "tags": { } } }
+  { "id": N, "presence":    { "channel": "ch" } }
+  { "id": N, "refresh":     { "token": "..." } }
+  { "id": N, "ping":        {} }
+  {}
+
+An empty C<{}> is a pong and refreshes the keepalive timer.
+
+Server to client:
+
+  { "id": N, "result": { ... } }
+  { "id": N, "error":  { "code": N, "message": "..." } }
+  { "push": { "channel": "ch", "pub": { "offset": N, "data": ..., "tags": { } } } }
+  { "push": { "channel": "ch", "join":  { "client": "...", "user": "..." } } }
+  { "push": { "channel": "ch", "leave": { "client": "...", "user": "..." } } }
+  {}
+
+=head2 Subscribe result
+
+  {
+    "channel": "ch",
+    "epoch":   "1700000000-1234-5678",
+    "offset":  N,
+    "recovered": true | false,
+    "publications": [ { "offset": N, "data": ..., "tags": { } }, ... ]   # only when recovered
+  }
+
+C<epoch> identifies one continuous history of the channel. It rotates
+when history is trimmed. C<offset> is the current head. On a fresh
+subscribe (no C<recover>), C<recovered> is false and C<publications>
+is absent. With C<recover: true>, C<epoch> and C<offset> matching the
+current state, and the gap still inside the retained window, the server
+returns C<recovered: true> with the missed publications inline.
+
+C<connect> result carries C<expires> as epoch seconds (C<0> = never),
+C<ping> and C<pong> timeouts, and C<server> node id. When C<expires>
+passes without a successful C<refresh>, the server sends C<109> and
+closes.
 
 =head1 ATTRIBUTES
 
@@ -920,27 +1120,29 @@ caller is authenticated as C<anonymous> with no channel restrictions.
 
 =head2 history_size
 
-Maximum number of publications retained per channel. Default 100.
+Maximum number of publications retained per channel. Default C<100>.
+Overridable per-namespace.
 
 =head2 history_ttl
 
 Seconds after which the history key of a channel expires. C<0> (the
 default) disables expiry. When positive, the TTL is refreshed on every
-publish.
+publish. Overridable per-namespace.
 
 =head2 ping_interval
 
-Seconds between server pings. Default 25.
+Seconds between server pings. Default C<25>.
 
 =head2 pong_timeout
 
 Seconds the server waits for a pong after a ping before closing the
-connection. Default 10.
+connection. Default C<10>.
 
 =head2 presence_ttl
 
 Seconds after which a presence entry is considered stale and dropped.
-Default 60. Stale entries are removed lazily on C<presence> queries.
+Default C<60>. Stale entries are removed lazily on C<presence> queries.
+Overridable per-namespace.
 
 =head2 protocol
 
@@ -955,7 +1157,73 @@ Redis key prefix. Default C<'centrifuge'>.
 =head2 presence_events
 
 When true (default), join/leave events are pushed to other subscribers
-of the same channel.
+of the same channel. Overridable per-namespace.
+
+=head2 namespaces
+
+  my $hub = Mojo::Centrifuge->new(
+      namespaces => {
+          chat => {
+              history_size         => 50,
+              history_ttl          => 3600,
+              presence             => 1,
+              presence_ttl         => 60,
+              presence_events      => 1,
+              client_channel_limit => 128,
+              force_recover        => 1,
+              epoch_key_ttl        => 3600,
+          },
+          notifications => {
+              history_size    => 20,
+              history_ttl     => 300,
+              presence        => 0,
+              presence_events => 0,
+          },
+      },
+  );
+
+Per-namespace overrides. A channel's namespace is the substring before
+the first C<:>. A channel without a colon belongs to the default
+namespace C<''>, governed by the hub attributes alone.
+
+Recognized keys: C<history_size>, C<history_ttl>, C<presence>,
+C<presence_ttl>, C<presence_events>, C<client_channel_limit>,
+C<force_recover>, C<epoch_key_ttl>. Absent keys inherit the hub value.
+
+C<force_recover> - when true, recovery is attempted even if the client
+sent C<recover: false>. Intended for namespaces where state continuity
+is mandatory.
+
+=head2 client_channel_limit
+
+Maximum simultaneous subscriptions per WebSocket connection. Default
+C<128>. Attempting to exceed returns C<201 bad subscribe>. Overridable
+per-namespace.
+
+=head2 publish_rate_limit
+
+Maximum client-initiated publishes per second, per WebSocket
+connection. Default C<0> (unlimited). Exceeding returns
+C<103 permission denied> with message C<publish rate limit exceeded>.
+Not applied to backend publishes via C<publish>.
+
+=head2 message_rate_limit
+
+Maximum inbound WebSocket frames per second, per connection, including
+pings and pongs. Default C<0> (unlimited). Exceeding closes the
+connection without a reply.
+
+=head2 client_recover
+
+When true (default), C<subscribe> with C<recover =E<gt> 1> honors
+recovery. Set to false to force all clients into a fresh epoch on
+reconnect (useful during incidents).
+
+=head2 epoch_key_ttl
+
+Seconds after which a channel's epoch key expires. Default C<0>
+(never). When positive, set it E<lt>= C<history_ttl> for the same
+namespace or recovery will fail spuriously.
 
 =head1 METHODS
 
@@ -970,25 +1238,53 @@ Verifies a client token and returns an identity hashref, or C<undef>
 on failure. Call this B<before> the WebSocket upgrade and render a
 real C<401> on failure.
 
+The identity hashref carries C<user>, C<bound_channel>, C<raw> (the
+decoded token payload), and C<token>.
+
 =head2 add_connection
 
   my $id = $hub->add_connection($c, $channel, $since, $identity);
 
 Registers a WebSocket connection. C<$c> must be a
-L<Mojolicious::Controller> in a websocket action.
+L<Mojolicious::Controller> in a websocket action. C<$channel> is an
+optional auto-subscribe channel; C<$since> is an optional history
+replay offset. Returns the numeric session id.
+
+Schedules the keepalive timer and the token expiry timer. If
+C<$channel> is defined and the identity is authorized for it, the
+session subscribes immediately.
 
 =head2 publish
 
   my $seq = $hub->publish($channel, $data);
+  my $seq = $hub->publish($channel, $data, { source => 'api' });
 
-Publishes C<$data> to C<$channel>. Returns the sequence number.
+Publishes C<$data> to C<$channel>. Returns the sequence number. The
+optional third argument is a tags hashref (string-to-scalar map);
+tags are stored in history and forwarded on the wire.
+
+Bypasses permission checks - intended for backend code. Client publish
+goes through C<can_publish>.
+
+=head2 broadcast
+
+  my $seq = $hub->broadcast($channel, $msg);
+
+Alias for C<publish>.
 
 =head2 subscribe
 
-  $hub->subscribe($id, $channel, $since);
+  my $result = $hub->subscribe($id, $channel, $since, \%opts);
 
-Subscribes the given session to C<$channel>, optionally replaying
-history after C<$since>.
+Subscribes the given session to C<$channel>. Returns a hashref.
+
+Called with three arguments, performs a legacy replay (sends each
+retained publication C<seq E<gt> $since> as an individual push frame)
+and returns C<{ channel, epoch }>.
+
+Called with four arguments, takes C<\%opts> with C<recover>, C<epoch>,
+and C<offset>, and returns a full result per the subscribe result
+frame documented above.
 
 =head2 unsubscribe
 
@@ -1001,7 +1297,15 @@ Removes the session from C<$channel>.
   my $arrayref = $hub->history_for($channel, $since);
 
 Returns retained publications of C<$channel> as an arrayref of
-C<{seq, data}> hashrefs, newest last.
+C<{seq, data, tags?}> hashrefs, newest last.
+
+=head2 history_remove
+
+  my $n = $hub->history_remove($channel);
+
+Clears retained history, sequence counter, and epoch for C<$channel>.
+Returns the number of removed history entries. Active subscribers are
+unaffected; new subscribers see an empty channel and a fresh epoch.
 
 =head2 presence
 
@@ -1009,6 +1313,26 @@ C<{seq, data}> hashrefs, newest last.
 
 Returns current members of C<$channel> as an arrayref of
 C<{id, user}>. Entries older than C<presence_ttl> are dropped first.
+Returns an empty arrayref when presence is disabled for the channel's
+namespace.
+
+=head2 channel_info
+
+  my $info = $hub->channel_info($channel);
+
+Returns C<{ channel, num_clients, num_users, history_length,
+last_offset, epoch }>.
+
+=head2 channel_stats
+
+  my $info = $hub->channel_stats($channel);
+
+Same as C<channel_info>, plus C<presence_users> - the count of distinct
+presence entries currently registered for C<$channel> after stale
+entries (older than C<presence_ttl>) are pruned. Returns C<undef> if
+C<$channel> has no live subscribers and no history.
+
+Used by operational dashboards and by C</metrics>.
 
 =head2 authorize_publish
 
@@ -1022,66 +1346,21 @@ Returns true if C<$identity> may publish to C<$channel>.
 
 Session-scoped variant of C<authorize_publish>.
 
+=head2 revoke_user
+
+  my $ids = $hub->revoke_user($user);
+
+Sends error 109 to every session owned by C<$user> and closes them.
+Clients are expected to reconnect with a fresh token. Returns an
+arrayref of the closed session ids.
+
 =head2 stats
 
   my $hashref = $hub->stats;
 
 Returns counters: C<connections>, C<sessions>, C<channels>,
-C<timestamp>, C<version>.
-
-=head2 broadcast
-
-  my $seq = $hub->broadcast($channel, $msg);
-
-Alias for C<publish>. Returns the sequence number.
-
-=head2 namespaces
-
-  my $hub = Mojo::Centrifuge->new(
-      namespaces => {
-          chat => {
-              history_size         => 50,
-              history_ttl          => 3600,
-              presence             => 1,
-              presence_ttl         => 60,
-              presence_events      => 1,
-              client_channel_limit => 128,
-          },
-          notifications => {
-              history_size    => 20,
-              history_ttl     => 300,
-              presence        => 0,
-              presence_events => 0,
-          },
-      },
-  );
-
-Per-namespace overrides for the hub attributes of the same name. A
-channel's namespace is the substring before the first C<:>; a channel
-with no colon lives in the default namespace C<''>, governed by the
-hub attributes alone.
-
-Recognized keys: C<history_size>, C<history_ttl>, C<presence>,
-C<presence_ttl>, C<presence_events>, C<client_channel_limit>,
-C<epoch_key_ttl>. Absent keys inherit the hub value.
-
-=head2 client_channel_limit
-
-Maximum simultaneous subscriptions per WebSocket connection. Default
-C<128>. Attempting to exceed returns C<201 bad subscribe>. Overridable
-per-namespace.
-
-=head2 epoch_key_ttl
-
-Seconds after which a channel's epoch key expires. Default C<0>
-(never). When positive, set it E<gt>= C<history_ttl> for the same
-namespace or recovery will fail spuriously.
-
-=head2 client_recover
-
-When true (default), C<subscribe> with C<recover =E<gt> 1> honors
-recovery. Set to false to force all clients into a fresh epoch on
-reconnect (useful during incidents).
+C<timestamp>, C<version>. Each channel entry includes C<namespace>,
+C<connections>, C<ids>, C<last_seq>, and C<history_len>.
 
 =head2 channel_count
 
@@ -1102,38 +1381,9 @@ this node.
   $hub->drop_session($id);
 
 Removes a session: unsubscribes it from all channels, updates presence,
-stops its ping timer, and forgets it. Called automatically when the
-WebSocket finishes; public so tests and admin endpoints can
+stops its ping and expiry timers, and forgets it. Called automatically
+when the WebSocket finishes; public so tests and admin endpoints can
 force-disconnect.
-
-=head1 AUTHORIZATION
-
-Token permissions are evaluated with glob matching (C<*> and C<?>).
-Fallback chain per operation:
-
-  <operation> (subscribe|publish) -> channels -> channel -> deny
-
-Two channel prefixes override the normal pattern match:
-
-=over 4
-
-=item * C<#> - server-only. Rejected for any client subscribe or
-publish attempt. Backend code may still use C<< $hub->publish('#x', ...) >>.
-
-=item * C<$user> - user-private. Only sessions whose token C<user>
-equals C<user> may subscribe. Publish authorization is unaffected.
-
-=back
-
-=head2 resolve_identity
-
-=head2 _channel_opts
-
-=head2 _namespace_of
-
-=head2 _current_epoch
-
-=head2 _reset_epoch
 
 =head2 _channel_opts
 
@@ -1142,8 +1392,82 @@ equals C<user> may subscribe. Publish authorization is unaffected.
 Returns the effective configuration for C<$channel> after namespace
 overrides are applied.
 
+=head1 AUTHORIZATION
+
+Token permissions are evaluated with glob matching (C<*> and C<?>).
+The fallback chain per operation is:
+
+  <operation> (subscribe|publish) -> channels -> channel -> deny
+
+Two channel prefixes override the normal pattern match:
+
+=over 4
+
+=item * C<#name> - server-only. Any client subscribe or publish attempt
+is rejected with C<103 permission denied>. Backend code may still
+call C<< $hub->publish('#name', ...) >> directly.
+
+=item * C<$user> - user-private. Only sessions whose token C<user>
+equals C<user> may subscribe. Publish authorization is unaffected.
+
+=back
+
+Namespace-scoped channels use a colon: C<chat:room1>. Patterns must
+match the same separator: a token scoped with C<subscribe =E<gt>
+['chat:*']> may subscribe to C<chat:room1> but not to C<room1>.
+
+=head1 ERROR CODES
+
+Imported from L<Mojo::Centrifuge::Protocol>:
+
+  100  internal error
+  101  unauthorized
+  103  permission denied
+  105  unknown method
+  107  bad request
+  108  not available
+  109  token expired
+  201  bad subscribe
+  202  bad publish
+
+=head1 MULTI-NODE
+
+Each node runs its own WebSocket server and shares the same Redis. Pub
+sub fan-out is via C<centrifuge:pubsub:E<lt>channelE<gt>>. Presence is
+stored in C<centrifuge:presence:E<lt>channelE<gt>> as a ZSET scored by
+join time; stale members are pruned lazily. Sequence numbers live in
+C<centrifuge:seq:E<lt>channelE<gt>>; epochs in
+C<centrifuge:epoch:E<lt>channelE<gt>>; history in
+C<centrifuge:history:E<lt>channelE<gt>>.
+
+Redis pub/sub drops messages on reconnect. At-least-once delivery
+requires Redis Streams, deferred to Phase 2.
+
+=head1 AUTHOR
+
+Your Name <you@example.com>
+
 =head1 LICENSE
 
 Same as Perl itself (see the LICENSE file).
 
+=head1 SEE ALSO
+
+L<Mojo::Centrifuge::Auth>, L<Mojo::Centrifuge::Protocol>,
+L<Mojo::Redis>, L<Mojolicious>.
+
+=head1 SEE ALSO
+
+L<Mojo::Centrifuge::Auth>, L<Mojo::Centrifuge::Protocol>,
+L<Mojo::Redis>, L<Mojolicious>.
+
+=for Pod::Coverage _allowed _channel_opts _current_epoch _match
+    _namespace_of _new_epoch _reset_epoch _schedule_expiry
+    _schedule_ping _wire_pub _wire_join_leave _ensure_subscribed
+    _local_send _presence_event _sid _member _history_key _seq_key
+    _pubsub_ch _presence_key _epoch_key _is_server_channel
+    _is_user_channel _user_channel_of _valid_channel _error_payload
+    _on_message_legacy _on_message_centrifuge _rate_ok
+
 =cut
+

@@ -147,4 +147,49 @@ subtest 'default namespace unaffected by overrides' => sub {
     ok !$exp, 'default ns has history_ttl=0, no expire';
 };
 
+subtest 'force_recover ignores client recover:false' => sub {
+    my $hub = new_hub(chat => { force_recover => 1, history_size => 10 });
+
+    $hub->publish('chat:x', 'm1');
+    $hub->publish('chat:x', 'm2');
+    my $epoch = $hub->_current_epoch('chat:x');
+
+    my ($id, $tx) = new_sess($hub, subscribe => ['chat:*']);
+    $hub->_on_message_centrifuge($id, $tx, encode_json({
+        id => 1,
+        subscribe => {
+            channel => 'chat:x',
+            recover => Mojo::JSON->false,
+            epoch   => $epoch,
+            offset  => 1,
+        },
+    }));
+    my $f = decode_json($tx->sent->[-1]);
+    ok $f->{result}{recovered}, 'recovered despite client recover:false';
+    is scalar @{ $f->{result}{publications} }, 1, 'got m2';
+    is $f->{result}{publications}[0]{data}, 'm2';
+};
+
+subtest 'force_recover absent keeps client recover:false behavior' => sub {
+    my $hub = new_hub(chat => { force_recover => 0, history_size => 10 });
+
+    $hub->publish('chat:y', 'm1');
+    $hub->publish('chat:y', 'm2');
+    my $epoch = $hub->_current_epoch('chat:y');
+
+    my ($id, $tx) = new_sess($hub, subscribe => ['chat:*']);
+    $hub->_on_message_centrifuge($id, $tx, encode_json({
+        id => 2,
+        subscribe => {
+            channel => 'chat:y',
+            recover => Mojo::JSON->false,
+            epoch   => $epoch,
+            offset  => 1,
+        },
+    }));
+    my $f = decode_json($tx->sent->[-1]);
+    ok !$f->{result}{recovered}, 'not recovered';
+    ok !exists $f->{result}{publications}, 'no publications';
+};
+
 done_testing;

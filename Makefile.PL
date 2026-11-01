@@ -22,6 +22,12 @@ WriteMakefile(
             },
         },
     },
+    PM => {
+        'lib/Mojo/Centrifuge.pm'              => '$(INST_LIB)/Mojo/Centrifuge.pm',
+        'lib/Mojo/Centrifuge/Auth.pm'         => '$(INST_LIB)/Mojo/Centrifuge/Auth.pm',
+        'lib/Mojo/Centrifuge/Protocol.pm'     => '$(INST_LIB)/Mojo/Centrifuge/Protocol.pm',
+        'lib/Mojo/Centrifuge/ExampleApp.pm'   => '$(INST_LIB)/Mojo/Centrifuge/ExampleApp.pm',
+    },
     PREREQ_PM => {
         'Mojolicious'  => '9.00',
         'Mojo::Redis'  => '3.00',

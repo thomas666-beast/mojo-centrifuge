@@ -68,6 +68,19 @@ sub zrange {
     return \@m;
 }
 
+sub del {
+    my ($s, @keys) = @_;
+    my $n = 0;
+    for my $k (@keys) {
+        $n++ if delete $s->{kv}{$k};
+        $n++ if delete $s->{lists}{$k};
+        $n++ if delete $s->{zsets}{$k};
+        $n++ if delete $s->{seq}{$k};
+    }
+    $s->_rec('del', @keys);
+    return $n;
+}
+
 # sets
 sub sadd { 1 } sub srem { 1 } sub smembers { [] }
 

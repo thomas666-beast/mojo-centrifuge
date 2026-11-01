@@ -5,7 +5,7 @@ use Mojo::Util qw(secure_compare);
 use Digest::SHA qw(hmac_sha256_base64);
 use MIME::Base64 qw(encode_base64 decode_base64);
 
-our $VERSION = '0.20';
+our $VERSION = '0.30';
 
 has 'secret';
 
@@ -156,5 +156,7 @@ L<Mojo::Centrifuge>.
 =head1 LICENSE
 
 Same as Perl itself (see the LICENSE file).
+
+=for Pod::Coverage _sign _b64_encode _b64_decode
 
 =cut
