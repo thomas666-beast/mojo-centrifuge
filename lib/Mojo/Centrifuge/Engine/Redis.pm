@@ -33,20 +33,20 @@ redis.call('LPUSH', KEYS[2], payload)
 redis.call('LTRIM', KEYS[2], 0, tonumber(ARGV[5]) - 1)
 redis.call('EXPIRE', KEYS[2], tonumber(ARGV[6]))
 redis.call('PUBLISH', ARGV[8], payload)
-return {seq, epoch}
+return string.format('%d', seq) .. ' ' .. epoch
 LUA
 
 my $STREAM_INFO = <<'LUA';
 redis.call('HSETNX', KEYS[1], 'e', ARGV[1])
 redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
 local m = redis.call('HMGET', KEYS[1], 'e', 's')
-return {m[1] or '', m[2] or '0'}
+return (m[1] or '') .. ' ' .. (m[2] or '0')
 LUA
 
 my $HISTORY = <<'LUA';
 local m = redis.call('HMGET', KEYS[1], 'e', 's')
 local list = redis.call('LRANGE', KEYS[2], 0, -1)
-return {m[1] or '', m[2] or '0', list}
+return (m[1] or '') .. ' ' .. (m[2] or '0') .. '\n' .. table.concat(list, '\n')
 LUA
 
 my $PRESENCE_ADD = <<'LUA';
@@ -70,16 +70,13 @@ if #expired > 0 then
   redis.call('HDEL', KEYS[2], unpack(expired))
 end
 local ids = redis.call('ZRANGEBYSCORE', KEYS[1], ARGV[1], '+inf')
-if #ids == 0 then return {} end
+if #ids == 0 then return '' end
 local vals = redis.call('HMGET', KEYS[2], unpack(ids))
 local out = {}
 for i, id in ipairs(ids) do
-  if vals[i] then
-    table.insert(out, id)
-    table.insert(out, vals[i])
-  end
+  if vals[i] then table.insert(out, id .. ' ' .. vals[i]) end
 end
-return out
+return table.concat(out, '\n')
 LUA
 
 my $counter = 0;
@@ -98,7 +95,21 @@ sub new {
 sub _b { return Encode::encode('UTF-8', "$_[0]") }                       # characters -> bytes
 sub _c { return defined $_[0] ? Encode::decode('UTF-8', "$_[0]") : undef }    # bytes -> characters
 sub _k { my ($s, $type, $ch) = @_; return "$s->{prefix}:$type:$ch" }
-sub _call { my ($s, @args) = @_; return $s->{redis}->db->call(map { _b($_) } @args) }
+sub _call {
+    my ($s, $cmd, @args) = @_;
+    my $db = $s->{redis}->db;
+    my @a  = map { _b($_) } @args;
+    my $m  = lc $cmd;
+    return $db->can($m) ? $db->$m(@a) : $db->call(uc $cmd, @a);
+}
+
+# Scripts return one string; anything else means the Redis client behaves differently than expected.
+sub _str {
+    my ($what, $r) = @_;
+    die "redis engine: unexpected reply to $what: " . (ref $r ? ref $r : (defined $r ? "'$r'" : 'undef')) . "\n"
+        if ref $r || !defined $r;
+    return _c($r);
+}
 sub _epoch { return substr Digest::SHA::sha1_hex(join '-', $$, time, rand(), ++$counter), 0, 8 }
 
 sub publish {
@@ -111,7 +122,9 @@ sub publish {
             _epoch(), JSON::PP->new->allow_nonref->encode("$ch"), $data_json, $info_json // 'null',
             $o->{history_size}, $o->{history_ttl}, $o->{meta_ttl} || 30 * 86400, $bus,
         );
-        return ($r->[0] + 0, _c($r->[1]));
+        my ($seq, $epoch) = split / /, _str(publish => $r), 2;
+        die "redis engine: bad publish reply\n" unless defined $epoch && $seq =~ /\A\d+\z/;
+        return ($seq + 0, $epoch);
     }
     $self->_call('PUBLISH', $bus, pub_payload($ch, 0, '', $data_json, $info_json));
     return (0, '');
@@ -121,18 +134,24 @@ sub stream_info {
     my ($self, $ch, $o) = @_;
     return (0, '') unless ($o->{history_size} // 0) > 0 && ($o->{history_ttl} // 0) > 0;
     my $r = $self->_call('EVAL', $STREAM_INFO, 1, $self->_k('meta', $ch), _epoch(), $o->{meta_ttl} || 30 * 86400);
-    return ($r->[1] + 0, _c($r->[0]));
+    my ($epoch, $seq) = split / /, _str(stream_info => $r), 2;
+    die "redis engine: bad stream_info reply\n" unless defined $seq && $seq =~ /\A\d+\z/;
+    return ($seq + 0, $epoch);
 }
 
 sub history {
     my ($self, $ch) = @_;
     my $r = $self->_call('EVAL', $HISTORY, 2, $self->_k('meta', $ch), $self->_k('hist', $ch));
+    my @lines = split /\n/, _str(history => $r);
+    my ($epoch, $seq) = split / /, (shift(@lines) // ' 0'), 2;
+    die "redis engine: bad history reply\n" unless defined $seq && $seq =~ /\A\d+\z/;
     my @pubs;
-    for my $raw (reverse @{ $r->[2] || [] }) {
-        my $m = decode_json(_c($raw));
+    for my $raw (reverse @lines) {    # list is newest first
+        next unless length $raw;
+        my $m = decode_json($raw);
         push @pubs, { offset => $m->{o} + 0, data => $m->{d}, (ref $m->{i} eq 'HASH' ? (info => $m->{i}) : ()) };
     }
-    return (\@pubs, $r->[1] + 0, _c($r->[0]));
+    return (\@pubs, $seq + 0, $epoch);
 }
 
 sub history_remove {
@@ -156,10 +175,12 @@ sub presence_remove {
 
 sub presence {
     my ($self, $ch) = @_;
-    my $flat = $self->_call('EVAL', $PRESENCE, 2, $self->_k('pz', $ch), $self->_k('ph', $ch), $self->{now}->());
+    my $r = $self->_call('EVAL', $PRESENCE, 2, $self->_k('pz', $ch), $self->_k('ph', $ch), $self->{now}->());
     my %out;
-    for (my $i = 0; $i + 1 < @$flat; $i += 2) {
-        $out{ _c($flat->[$i]) } = decode_json(_c($flat->[ $i + 1 ]));
+    for my $line (split /\n/, _str(presence => $r)) {
+        my ($id, $json) = split / /, $line, 2;
+        next unless defined $json;
+        $out{$id} = decode_json($json);
     }
     return \%out;
 }

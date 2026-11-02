@@ -6,7 +6,7 @@ WriteMakefile(
     NAME             => 'Mojo::Centrifuge',
     VERSION_FROM     => 'lib/Mojo/Centrifuge.pm',
     ABSTRACT         => 'Centrifugo-like realtime pub/sub server for Mojolicious',
-    AUTHOR           => 'Your Name <you@example.com>',
+    AUTHOR           => 'Thomas <selfworker112@mailfence.com>',
     LICENSE          => 'perl_5',
     MIN_PERL_VERSION => '5.016',
     META_MERGE       => {
@@ -14,11 +14,11 @@ WriteMakefile(
         resources   => {
             repository => {
                 type => 'git',
-                url  => 'https://github.com/YOU/mojo-centrifuge.git',
-                web  => 'https://github.com/YOU/mojo-centrifuge',
+                url  => 'https://github.com/thomas666-beast/mojo-centrifuge.git',
+                web  => 'https://github.com/thomas666-beast/mojo-centrifuge',
             },
             bugtracker => {
-                web => 'https://github.com/YOU/mojo-centrifuge/issues',
+                web => 'https://github.com/thomas666-beast/mojo-centrifuge/issues',
             },
         },
     },
@@ -31,10 +31,6 @@ WriteMakefile(
     PREREQ_PM => {
         'Mojolicious'  => '9.00',
         'Mojo::Redis'  => '3.00',
-        'Mojo::Util'   => 0,
-        'Mojo::JSON'   => 0,
-        'Digest::SHA'  => 0,
-        'MIME::Base64' => 0,
     },
     TEST_REQUIRES => {
         'Test::More' => '1.302',

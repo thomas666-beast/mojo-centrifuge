@@ -19,8 +19,9 @@ if ($ENV{TEST_REDIS}) {
     my $redis  = Mojo::Redis->new($ENV{TEST_REDIS});
     push @engines, [ redis => sub { Mojo::Centrifuge::Engine::Redis->new(redis => $redis, prefix => $prefix) } ];
     $cleanup = sub {
-        my $keys = $redis->db->call('KEYS', "$prefix:*");
-        $redis->db->call('DEL', @$keys) if @$keys;
+        my $db   = $redis->db;
+        my $keys = $db->keys("$prefix:*");    # method style: arrayref in scalar context
+        $db->del(@$keys) if ref $keys eq 'ARRAY' && @$keys;
     };
 }
 
